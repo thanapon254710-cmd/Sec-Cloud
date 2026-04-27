@@ -91,6 +91,21 @@ pip install flask pycryptodome networkx neo4j numpy pandas matplotlib python-dot
 
 ---
 
+## VS Code Configuration
+If you're using VS Code, add the following to your .vscode/settings.json to automatically load the .env file into the integrated terminal when running or debugging the evaluation script:
+
+```
+jsonc{
+  "python.terminal.useEnvFile": true
+}
+```
+
+This tells the Python extension to read environment variables from the .env file specified in python.envFile (which defaults to ${workspaceFolder}/.env). This means your NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, BATCH_SIZE, and REPEAT values will be available automatically whenever you run DVHGQP-Evaluation.py from the terminal or debugger — no manual export or set needed.
+
+> This setting affects the integrated terminal and the debugger. If you run Python from an external terminal outside VS Code, you will still need to load the .env file manually (e.g., via python-dotenv as already used in the script).
+
+---
+
 ## Configuration
 
 Create a `.env` file in the project root for the evaluation script:
