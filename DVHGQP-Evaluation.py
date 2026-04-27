@@ -648,7 +648,7 @@ def run_bfs_benchmark(driver, K, adj_plain, node_label, degree):
                     runs_b.append(result_b)
                 baseline_rows.append({
                     "class": cls, "start_degree": degree.get(start,0),
-                    "depth": depth, "scheme": "Baseline",
+                    "depth": depth, "k": k, "scheme": "Baseline",
                     "visited":     round(np.mean([r["visited"]    for r in runs_b])),
                     "t_neo4j_ms":  round(np.mean([r["t_neo4j_ms"] for r in runs_b]),2),
                     "t_tee_ms":    0.0, "t_spark_ms": 0.0,
@@ -916,7 +916,7 @@ def main():
     print(f"[Phase 2] Connecting to Neo4j: {CONFIG['NEO4J_URI']}")
     driver = GraphDatabase.driver(CONFIG["NEO4J_URI"], auth = (CONFIG["NEO4J_USERNAME"], CONFIG["NEO4J_PASSWORD"]))
     driver.verify_connectivity()
-    print("           Connection verified.")
+    print("          Connection verified.")
     phase2_load_neo4j(driver, enc_nodes, enc_edges, enc_adj)
  
     label_results = run_label_benchmark(driver, dsse_index, Ks, Ke, K, hist)
