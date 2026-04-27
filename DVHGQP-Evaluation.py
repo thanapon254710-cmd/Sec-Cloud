@@ -852,8 +852,9 @@ def make_comparison_plots(bfs_dvh, bfs_base, sg_dvh, sg_base, out_dir="outputs")
         ("mid_degree",  "#1D4ED8",           "#B91C1C",           "-",  "--"),
         ("low_degree",  "#60A5FA",           "#F87171",           "-",  "--"),
     ]:
-        sub_d = df_dvh_bfs[df_dvh_bfs["class"]==cls].sort_values("depth")
-        sub_b = df_base_bfs[df_base_bfs["class"]==cls].sort_values("depth")
+
+        sub_d = df_dvh_bfs[(df_dvh_bfs["class"]==cls) & (df_dvh_bfs["k"]==4)].sort_values("depth")
+        sub_b = df_base_bfs[(df_base_bfs["class"]==cls) & (df_base_bfs["k"]==4)].sort_values("depth")
         deg   = sub_d.iloc[0]["start_degree"] if not sub_d.empty else "?"
         if not sub_d.empty:
             ax.plot(sub_d["depth"], sub_d["t_total_ms"], "o"+ls_d, lw=2,
