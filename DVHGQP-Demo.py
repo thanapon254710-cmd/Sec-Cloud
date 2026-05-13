@@ -24,7 +24,12 @@ def aes_gcm_decrypt(key, blob):
     return AES.new(key, AES.MODE_GCM, nonce=n).decrypt_and_verify(ct,tag)
 def prf(ks, w): 
     return hashlib.sha256(ks+w.encode()).hexdigest()
-def pad_size(r, ratio=0.10): 
+def pad_size(r): # Adaptive padding strategy based on result size r 
+    if    r == 0:   return 0
+    if    r < 1000: ratio = 0.25 #small
+    elif  r < 5000: ratio = 0.15 #medium
+    else:           ratio = 0.10 #large
+        
     return r + max(1, math.ceil(r * ratio))
 
 # ── In-memory graph store ───────────────────────────────
@@ -151,7 +156,7 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
         result = len(STATE["edges"])
         return {"query": q, "result": result, "unit": "edges",
                 "explanation": f"The graph contains {result} edges total.",
-                "latency_ms": round((time.perf_counter()-t0)*1000, 2)}
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
     # ── Degree / friends of node X ──
     import re
@@ -167,11 +172,11 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
             return {"query": q, "result": result, "unit": "connections",
                     "explanation": f"Node {nid} ({node_label.get(nid,'unknown')}) has {result} connections. "
                                    f"Sample neighbors: {neighbor_ids}{'...' if result>10 else ''}",
-                    "latency_ms": round((time.perf_counter()-t0)*1000, 2)}
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 2)}
         else:
             return {"query": q, "result": 0, "unit": "connections",
                     "explanation": f"Node {nid} not found in graph.",
-                    "latency_ms": round((time.perf_counter()-t0)*1000, 2)}
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
     # ── Label of node X ──
     lbl_match = re.search(r'(?:label|type|role).*?node\s+(\d+)|node\s+(\d+).*?(?:label|type|role|what is)', q_lower)
@@ -196,7 +201,7 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
                 p_r = entry["p_r"]
                 return {"query": q, "result": len(real_ids), "unit": f"{lbl} nodes",
                         "explanation": f"Found {len(real_ids)} {lbl} nodes. "
-                                       f"DSSE padding P(r)={p_r} (10% overhead = {p_r-len(real_ids)} dummy entries). "
+                                       f"DSSE padding P(r)={p_r} ({((p_r - len(real_ids)) * 100 // len(real_ids))}% overhead = {p_r - len(real_ids)} dummy entries). "
                                        f"SP only sees {p_r} encrypted entries — cannot determine true count.",
                         "latency_ms": round((time.perf_counter() - t0 ) * 1000, 2),
                         "privacy_note": f"Leakage: L(q) = (P(r)={p_r}, access_time)"}
@@ -212,7 +217,7 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
         if start not in adj:
             return {"query": q, "result": 0, "unit": "reachable nodes",
                     "explanation": f"Node {start} not found.",
-                    "latency_ms": round((time.perf_counter()-t0)*1000, 2)}
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
         visited = {start}; frontier = [start]
         level_info = []
@@ -239,7 +244,10 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
     if reach_match:
         src, dst = int(reach_match.group(1)), int(reach_match.group(2))
         # BFS from src
-        visited = {src}; frontier = [src]; found = False; hops = 0
+        visited = {src}
+        frontier = [src]
+        found = False
+        hops = 0
         while frontier and hops < 4:
             new_f = []
             for nid in frontier:
@@ -249,7 +257,8 @@ def parse_query(q, node_label, edge_label, adj, enc_adj, K, Ks, Ke, dsse_index):
                     if nbr not in visited:
                         visited.add(nbr); new_f.append(nbr)
                 if found: break
-            hops += 1; frontier = new_f
+            hops += 1
+            frontier = new_f
         return {"query": q, "result": "YES" if found else "NO (within 4 hops)",
                 "unit": "reachability",
                 "explanation": f"Node {src} → Node {dst}: {'REACHABLE' if found else 'NOT REACHABLE within 4 hops'}. "
