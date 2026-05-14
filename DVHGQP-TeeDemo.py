@@ -1,27 +1,4 @@
-"""
-DVH-GQP  —  TeeDemo
-────────────────────────────────────────────────────────────
-Run (local / no enclave):
-    pip install flask pycryptodome
-    python DVHGQP-TeeDemo.py
-
-Run (full TEE stack):
-    pip install flask pycryptodome neo4j pyspark python-dotenv
-    Set NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD / ENCLAVE_CID / ENCLAVE_PORT
-    in a .env file, then: python DVHGQP-TeeDemo.py
-
-Then open: http://localhost:5000
-
-Architecture
-────────────
-• Plaintext never leaves the TEE boundary.
-• The host (this process) holds encrypted adjacency lists (enc_adj) and
-  an encrypted DSSE label index (dsse_index).
-• Every crypto operation that touches raw graph data is sent to the
-  Nitro Enclave via vsock.
-• When the enclave is not reachable (local demo mode) the same operations
-  fall back to in-process AES-GCM — identical results, no TEE guarantee.
-"""
+#DVH-GQP  —  TeeDemo
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, time, math, hashlib, collections, gzip, urllib.request, re
@@ -65,7 +42,7 @@ def keygen():                    return get_random_bytes(32)
 def prf(ks, w):                  return hashlib.sha256(ks + w.encode()).hexdigest()
 def pad_size(r): # Adaptive padding strategy based on result size r 
     if    r == 0:   return 0
-    if    r < 1000: ratio = 0.25 #small
+    if    r < 1000: ratio = 0.20 #small
     elif  r < 5000: ratio = 0.15 #medium
     else:           ratio = 0.10 #large
         
@@ -211,7 +188,7 @@ def assign_labels(nodes, edges):
 
     from collections import Counter
     dist = Counter(edge_label.values())
-    print(f"[Phase 0] Edge label distribution")
+    print(f"[Phase 0] Edge label distribution:")
 
     return node_label, edge_label, degree
 

@@ -1303,7 +1303,6 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     path = os.path.join(out_dir, "dvhgqp_vs_related_work.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"[Output] Saved: {path}")
     return path
 
 # ── Enclave startup check ────────────────────────────────
