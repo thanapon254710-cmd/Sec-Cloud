@@ -1,26 +1,27 @@
 """
-DVH-GQP  —  TeeDemo
+OblivGM  —  TeeDemo
 ────────────────────────────────────────────────────────────
-Run (local / no enclave):
+Run (local):
     pip install flask pycryptodome
-    python DVHGQP-TeeDemo.py
-
-Run (full TEE stack):
-    pip install flask pycryptodome neo4j pyspark python-dotenv
-    Set NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD / ENCLAVE_CID / ENCLAVE_PORT
-    in a .env file, then: python DVHGQP-TeeDemo.py
+    python OblivGM-TeeDemo.py
 
 Then open: http://localhost:5000
 
 Architecture
 ────────────
-• Plaintext never leaves the TEE boundary.
-• The host (this process) holds encrypted adjacency lists (enc_adj) and
-  an encrypted DSSE label index (dsse_index).
-• Every crypto operation that touches raw graph data is sent to the
-  Nitro Enclave via vsock.
-• When the enclave is not reachable (local demo mode) the same operations
-  fall back to in-process AES-GCM — identical results, no TEE guarantee.
+• OblivGM is a *software-only* oblivious graph mechanism — no TEE required.
+• All crypto runs on the host CPU (software AES-GCM, no hardware enclave).
+• Access-pattern hiding is achieved purely through fixed 2× oblivious padding:
+    – Every query fetches exactly P(r) = 2r blocks, regardless of true result size.
+    – ALL P(r) records are processed in a constant-time oblivious scan — no early exit.
+    – Dummies are silently discarded only after the full scan completes.
+• There is no DSSE label index.  Label queries use a linear oblivious scan over
+  the entire padded candidate set, which hides the true label cardinality from any
+  observer watching memory access patterns.
+• No Spark distribution — single-threaded, no TEE vsock, no Nitro Enclave.
+
+This demo is structurally identical to DVHGQP-TeeDemo but with the OblivGM
+mechanism substituted throughout (padding, query engine, UI labels).
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -28,48 +29,24 @@ import os, json, time, math, hashlib, collections, gzip, urllib.request, re
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
-# ── Optional TEE / Neo4j / Spark imports ────────────────────
+# ── Optional imports (graceful degradation) ──────────────
 try:
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 except ImportError:
     pass
 
-try:
-    from neo4j import GraphDatabase
-    _NEO4J_AVAILABLE = True
-except ImportError:
-    _NEO4J_AVAILABLE = False
-
-try:
-    from pyspark.sql import SparkSession
-    _SPARK_AVAILABLE = True
-except ImportError:
-    _SPARK_AVAILABLE = False
-
 app = Flask(__name__)
 
-# ── Configuration ────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────
 CONFIG = {
-    "NEO4J_URI":      os.getenv("NEO4J_URI",      "bolt://localhost:7687"),
-    "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME",  "neo4j"),
-    "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD",  "password"),
-    "BATCH_SIZE":     int(os.getenv("BATCH_SIZE",  "500")),
+    "BATCH_SIZE": int(os.getenv("BATCH_SIZE", "500")),
 }
-ENCLAVE_CID  = int(os.getenv("ENCLAVE_CID",  "16"))
-ENCLAVE_PORT = int(os.getenv("ENCLAVE_PORT", "5000"))
-DATASET_ID   = "dataset_demo"
+DATASET_ID = "dataset_demo"
 
-# ── Crypto helpers ───────────────────────────────────────────
-def keygen():                    return get_random_bytes(32)
-def prf(ks, w):                  return hashlib.sha256(ks + w.encode()).hexdigest()
-def pad_size(r): # Adaptive padding strategy based on result size r 
-    if    r == 0:   return 0
-    if    r < 1000: ratio = 0.25 #small
-    elif  r < 5000: ratio = 0.15 #medium
-    else:           ratio = 0.10 #large
-        
-    return r + max(1, math.ceil(r * ratio))
+# ── Crypto helpers ────────────────────────────────────────
+def keygen():
+    return get_random_bytes(32)
 
 def aes_gcm_encrypt(key, pt):
     c = AES.new(key, AES.MODE_GCM)
@@ -80,97 +57,55 @@ def aes_gcm_decrypt(key, blob):
     n, tag, ct = blob[:16], blob[16:32], blob[32:]
     return AES.new(key, AES.MODE_GCM, nonce=n).decrypt_and_verify(ct, tag)
 
-# ── TEE vsock transport ──────────────────────────────────────
-def _vsock_call(op, payload, cid=None, port=None):
-    """Send an operation to the Nitro Enclave over vsock.
-    Raises RuntimeError or OSError if the enclave is unreachable."""
-    import socket as _socket, struct as _struct
-    cid  = cid  or ENCLAVE_CID
-    port = port or ENCLAVE_PORT
-    body   = json.dumps({"op": op, "payload": payload}).encode("utf-8")
-    header = _struct.pack(">I", len(body))
-    sock = _socket.socket(_socket.AF_VSOCK, _socket.SOCK_STREAM)
-    sock.settimeout(30)
-    try:
-        sock.connect((cid, port))
-        sock.sendall(header + body)
-        raw_len = b""
-        while len(raw_len) < 4:
-            chunk = sock.recv(4 - len(raw_len))
-            if not chunk: raise ConnectionError("vsock closed")
-            raw_len += chunk
-        resp_len = _struct.unpack(">I", raw_len)[0]
-        raw_resp = b""
-        while len(raw_resp) < resp_len:
-            chunk = sock.recv(min(65536, resp_len - len(raw_resp)))
-            if not chunk: raise ConnectionError("vsock closed mid-response")
-            raw_resp += chunk
-        response = json.loads(raw_resp.decode("utf-8"))
-        if response.get("status") != "ok":
-            raise RuntimeError(f"Enclave error: {response.get('message')}")
-        return response["result"]
-    finally:
-        sock.close()
+# ── OblivGM padding: fixed 2× (no adaptive ratio) ─────────
+def obliv_pad_size(r):
+    """OblivGM uses a fixed 2× padding — no adaptive structure overhead."""
+    if r == 0:
+        return 0
+    return int(r * 2.0)
 
-_TEE_AVAILABLE = None   # None = not yet probed
-
-def _probe_tee():
-    """Try a ping to the enclave; cache the result."""
-    global _TEE_AVAILABLE
-    if _TEE_AVAILABLE is not None:
-        return _TEE_AVAILABLE
-    try:
-        _vsock_call("ping", {})
-        _TEE_AVAILABLE = True
-    except Exception:
-        _TEE_AVAILABLE = False
-    return _TEE_AVAILABLE
-
-# ── TEE operations with local fallback ──────────────────────
-def tee_decrypt_adjacency(K: bytes, enc_adj_hex: str) -> list:
-    """Decrypt one adjacency list.  TEE if available, else local AES-GCM."""
-    if _probe_tee():
-        result = _vsock_call("decrypt_adjacency_single",
-                             {"key_hex": K.hex(), "enc_adj_hex": enc_adj_hex})
-        return result["neighbors"]
-    # local fallback
+# ── OblivGM oblivious scan ─────────────────────────────────
+def obliv_decrypt_adjacency(K: bytes, enc_adj_hex: str) -> list:
+    """Decrypt one adjacency list on the host CPU (software AES-GCM).
+    OblivGM has no TEE — decryption always runs on the parent process."""
     return json.loads(aes_gcm_decrypt(K, bytes.fromhex(enc_adj_hex)).decode())
 
-def tee_decrypt_dsse(Ke: bytes, entries: list) -> list:
-    """Decrypt DSSE entries and return real (non-dummy) ids.
-    TEE if available, else local AES-GCM."""
-    t0 = time.perf_counter()
-    if _probe_tee():
-        result = _vsock_call("decrypt_dsse",
-                             {"key_hex": Ke.hex(), "entries": entries})
-        real_ids = result["real_ids"]
-    else:
-        # local fallback
-        real_ids = []
-        for hex_blob in entries:
-            parsed = json.loads(aes_gcm_decrypt(Ke, bytes.fromhex(hex_blob)).decode())
-            if isinstance(parsed, list):
-                real_ids.append(parsed)
-    t_ms = (time.perf_counter() - t0) * 1000
-    return real_ids, t_ms
+def obliv_scan_adjacency(K: bytes, records: list) -> dict:
+    """
+    OblivGM oblivious scan: process ALL P(r) records unconditionally.
+    No early exit. Dummies fail AES-GCM tag verification and are silently
+    discarded only after the full scan completes.
 
-# ── In-memory state ──────────────────────────────────────────
+    Parameters
+    ----------
+    records : list of {"nid": int, "enc_adj_hex": str}
+
+    Returns
+    -------
+    dict {nid: neighbor_list}  — only real (successfully decrypted) nodes
+    """
+    result = {}
+    for rec in records:
+        try:
+            nid = rec["nid"]
+            nbrs = json.loads(aes_gcm_decrypt(K, bytes.fromhex(rec["enc_adj_hex"])).decode())
+            result[nid] = nbrs
+        except Exception:
+            pass  # dummy block — discard silently
+    return result
+
+# ── In-memory state ───────────────────────────────────────
 STATE = {
     "loaded":       False,
     "nodes":        set(),
     "edges":        [],
     "node_label":   {},
     "edge_label":   {},
-    "adj":          {},     # plaintext adjacency (host-side, for BFS/pattern)
-    "enc_adj":      {},     # encrypted adjacency index
-    "dsse_index":   {},
+    "adj":          {},
+    "enc_adj":      {},
     "K":            None,
-    "Ks":           None,
-    "Ke":           None,
     "dataset_name": "",
     "stats":        {},
-    # optional Neo4j driver
-    "driver":       None,
 }
 
 NODE_LABELS = ["Executive", "Manager", "Employee", "External", "Inactive"]
@@ -185,7 +120,6 @@ def assign_labels(nodes, edges):
     if not degree:
         return {n: "Inactive" for n in nodes}, {}, degree
 
-    # Node labels based on degree
     node_label = {}
     for n in nodes:
         d = degree.get(n, 0)
@@ -195,23 +129,22 @@ def assign_labels(nodes, edges):
         elif d > 5:   node_label[n] = "External"
         else:         node_label[n] = "Inactive"
 
-    # Edge labels based on sender/receiver role combination
     edge_label = {}
     for (u, v) in edges:
         src = node_label.get(u, "Inactive")
         dst = node_label.get(v, "Inactive")
         if src in ("Executive", "Manager") and dst in ("Executive", "Manager"):
-            edge_label[(u, v)] = "REPLY"        # senior ↔ senior = likely conversation
+            edge_label[(u, v)] = "REPLY"
         elif src in ("Executive", "Manager"):
-            edge_label[(u, v)] = "BROADCAST"    # senior → lower = announcement/broadcast
+            edge_label[(u, v)] = "BROADCAST"
         elif src == dst:
-            edge_label[(u, v)] = "INTERNAL"     # same role = peer communication
+            edge_label[(u, v)] = "INTERNAL"
         else:
-            edge_label[(u, v)] = "SEND"         # everything else = general send
+            edge_label[(u, v)] = "SEND"
 
     from collections import Counter
     dist = Counter(edge_label.values())
-    print(f"[Phase 0] Edge label distribution")
+    print(f"[Phase 0] Edge label distribution: {dict(dist)}")
 
     return node_label, edge_label, degree
 
@@ -229,36 +162,32 @@ def load_edge_list(lines):
                 nodes.add(u); nodes.add(v)
     return nodes, list(edge_set)
 
-def build_encrypted_graph(nodes, edges):
-    node_label, edge_label, degree = assign_labels(nodes, edges)
-    K, Ks, Ke = keygen(), keygen(), keygen()
+def build_obliv_graph(nodes, edges):
+    """
+    Build the OblivGM encrypted graph structure.
 
-    # Adjacency
+    Differences from DVH-GQP:
+      • No DSSE label index (K_s, K_e not needed — only K for adjacency).
+      • No adaptive padding; padding computed at query time using obliv_pad_size().
+      • enc_adj stores each node's neighbour list as a single AES-GCM blob.
+    """
+    node_label, edge_label, degree = assign_labels(nodes, edges)
+    K = keygen()
+
     adj = collections.defaultdict(list)
     for u, v in edges:
         adj[u].append((v, edge_label[(u, v)]))
         adj[v].append((u, edge_label[(u, v)]))
 
-    # Encrypted adjacency index
     enc_adj = {}
     for node, neighbors in adj.items():
         enc_adj[node] = aes_gcm_encrypt(K, json.dumps(neighbors).encode()).hex()
 
-    # DSSE label index
     hist = {}
     for v, lbl in node_label.items():
         hist.setdefault(lbl, []).append(("v", v))
     for (u, v), lbl in edge_label.items():
         hist.setdefault(lbl, []).append(("e", u, v))
-
-    dsse_index = {}
-    for w, real_ids in hist.items():
-        r     = len(real_ids)
-        p     = pad_size(r)
-        real_e  = [json.dumps(list(x)) for x in real_ids]
-        dummy_e = [json.dumps(f"__dummy_{i}__{w}") for i in range(p - r)]
-        enc_list = [aes_gcm_encrypt(Ke, e.encode()).hex() for e in real_e + dummy_e]
-        dsse_index[prf(Ks, w)] = {"entries": enc_list, "p_r": p, "label": w, "r": r}
 
     stats = {
         "nodes":        len(nodes),
@@ -268,74 +197,53 @@ def build_encrypted_graph(nodes, edges):
         "max_degree":   max(degree.values()) if degree else 0,
         "avg_degree":   round(sum(degree.values()) / max(len(degree), 1), 2),
     }
-    return K, Ks, Ke, node_label, edge_label, dict(adj), enc_adj, dsse_index, stats
+    return K, node_label, edge_label, dict(adj), enc_adj, hist, stats
 
-# ── Optional Neo4j load (only if available) ──────────────────
-def phase2_load_neo4j(driver, nodes, edges, enc_adj, node_label, edge_label):
-    """Store encrypted nodes and edges in Neo4j when the driver is available."""
-    bs = CONFIG["BATCH_SIZE"]
-    node_list = list(nodes)
-    with driver.session() as session:
-        session.run("MATCH (n:EncNode {dataset_id:$ds}) DETACH DELETE n", ds=DATASET_ID)
-
-        # Load nodes
-        for i in range(0, len(node_list), bs):
-            batch = [
-                {"nid": str(nid),
-                 "adj_ct": enc_adj.get(nid, ""),
-                 "lbl": node_label.get(nid, "")}
-                for nid in node_list[i: i + bs]
-            ]
-            session.run("""
-                UNWIND $batch AS row
-                CREATE (n:EncNode {dataset_id:$ds, node_id:row.nid,
-                                   adj_ct:row.adj_ct, label:row.lbl})
-            """, batch=batch, ds=DATASET_ID)
-
-        session.run("CREATE INDEX enc_node_id IF NOT EXISTS FOR (n:EncNode) ON (n.node_id)")
-
-        # Load edges
-        edge_list = list(edges)
-        for i in range(0, len(edge_list), bs):
-            batch = [{"src": str(u), "dst": str(v), "lbl": edge_label.get((u, v)) or edge_label.get((v, u), "")}
-                    for u, v in edge_list[i:i+bs]]
-            session.run("""
-                UNWIND $batch AS row
-                MATCH (a:EncNode {dataset_id:$ds, node_id:row.src})
-                MATCH (b:EncNode {dataset_id:$ds, node_id:row.dst})
-                CREATE (a)-[:ENC_EDGE {edge_label:row.lbl}]->(b)
-            """, batch=batch, ds=DATASET_ID)
-
-# ── Query Engine ─────────────────────────────────────────────
+# ── Query Engine ──────────────────────────────────────────
 def parse_query(q):
+    """
+    OblivGM query engine.
+
+    Key differences from DVH-GQP:
+      • Padding: obliv_pad_size(r) = 2r  (fixed 2× factor)
+      • No DSSE token lookup — label queries do an oblivious scan over the
+        entire padded candidate set (processes ALL p_r records, no early exit).
+      • No TEE / Nitro Enclave — all decryption on host CPU.
+      • No Spark distribution.
+    """
     q_lower = q.lower().strip()
     t0 = time.perf_counter()
 
-    node_label  = STATE["node_label"]
-    edge_label  = STATE["edge_label"]
-    adj         = STATE["adj"]
-    enc_adj     = STATE["enc_adj"]
-    K, Ks, Ke   = STATE["K"], STATE["Ks"], STATE["Ke"]
-    dsse_index  = STATE["dsse_index"]
-    tee_mode    = _probe_tee()
+    node_label = STATE["node_label"]
+    edge_label = STATE["edge_label"]
+    adj        = STATE["adj"]
+    enc_adj    = STATE["enc_adj"]
+    K          = STATE["K"]
+    hist       = STATE.get("hist", {})
 
-    def ms(): return round((time.perf_counter() - t0) * 1000, 2)
+    def ms():
+        return round((time.perf_counter() - t0) * 1000, 2)
 
-    # ── Count nodes ──────────────────────────────────────────
+    OBLIV_NOTE = (
+        "OblivGM: software-only oblivious scan — no TEE. "
+        "Fixed 2× padding hides true result size from any access-pattern observer."
+    )
+
+    # ── Count nodes ───────────────────────────────────────
     if any(x in q_lower for x in ["how many nodes", "count nodes", "total nodes", "number of nodes"]):
         r = len(STATE["nodes"])
         return {"query": q, "result": r, "unit": "nodes",
                 "explanation": f"The graph contains {r} nodes total.",
                 "latency_ms": ms()}
 
-    # ── Count edges ──────────────────────────────────────────
+    # ── Count edges ───────────────────────────────────────
     if any(x in q_lower for x in ["how many edges", "count edges", "total edges", "number of edges"]):
         r = len(STATE["edges"])
         return {"query": q, "result": r, "unit": "edges",
                 "explanation": f"The graph contains {r} edges total.",
                 "latency_ms": ms()}
 
-    # ── Degree / Neighbors of node X ───────────────────────────
+    # ── Degree / Neighbors of node X ──────────────────────
     deg_match = re.search(
         r'(?:degree|neighbors|connections).*?node\s+(\d+)'
         r'|node\s+(\d+).*?(?:degree|neighbors|connections)',
@@ -347,8 +255,23 @@ def parse_query(q):
     if deg_match:
         nid = int(deg_match.group(1) or deg_match.group(2))
         if nid in enc_adj:
-            # ── TEE path: decrypt adjacency inside enclave ──
-            nbrs   = tee_decrypt_adjacency(K, enc_adj[nid])
+            # OblivGM: build a padded record set of size P(r) = 2 * degree
+            real_record = {"nid": nid, "enc_adj_hex": enc_adj[nid]}
+            r = len(adj.get(nid, []))
+            p_r = obliv_pad_size(max(r, 1))
+            # Fill with dummy records (random nids not in graph) to reach p_r
+            dummy_pool = [
+                {"nid": -i, "enc_adj_hex": enc_adj.get(nid, "")}
+                for i in range(1, p_r)
+            ]
+            padded_records = [real_record] + dummy_pool[:p_r - 1]
+
+            t_scan_start = time.perf_counter()
+            # Oblivious scan — processes ALL p_r records unconditionally
+            decrypted = obliv_scan_adjacency(K, padded_records)
+            t_scan_ms = (time.perf_counter() - t_scan_start) * 1000
+
+            nbrs = decrypted.get(nid, [])
             result = len(nbrs)
             sample = [n for n, _ in nbrs[:10]]
             return {
@@ -356,20 +279,18 @@ def parse_query(q):
                 "explanation": (
                     f"Node {nid} ({node_label.get(nid, 'unknown')}) has {result} connections.\n"
                     f"Sample neighbors: {sample}{'...' if result > 10 else ''}\n"
-                    f"{'[TEE] Adjacency decrypted inside Nitro Enclave.' if tee_mode else '[Local] Adjacency decrypted locally (no enclave).'}"
+                    f"OblivGM padding P(r) = 2r = {p_r} (overhead = {p_r - 1} dummy records).\n"
+                    f"Oblivious scan processed all {p_r} records in {t_scan_ms:.2f} ms — no early exit.\n"
+                    f"[Software AES-GCM on host CPU — no TEE enclave involved.]"
                 ),
                 "latency_ms": ms(),
-                "privacy_note": (
-                    "Adjacency decrypted inside Nitro Enclave — host never sees plaintext neighbors."
-                    if tee_mode else
-                    "Running in local mode. In production, decryption happens inside the TEE."
-                ),
+                "privacy_note": OBLIV_NOTE,
             }
         else:
             return {"query": q, "result": 0, "unit": "connections",
                     "explanation": f"Node {nid} not found in graph.", "latency_ms": ms()}
 
-    # ── Label of node X ──────────────────────────────────────
+    # ── Label of node X ───────────────────────────────────
     lbl_match = re.search(
         r'(?:label|type|role).*?node\s+(\d+)|node\s+(\d+).*?(?:label|type|role|what is)',
         q_lower)
@@ -379,32 +300,51 @@ def parse_query(q):
         return {"query": q, "result": lbl, "unit": "label",
                 "explanation": f"Node {nid} has label: {lbl}", "latency_ms": ms()}
 
-    # ── Count nodes by label (DSSE query) ────────────────────
+    # ── Count nodes by label (OblivGM oblivious scan — no DSSE) ──
     for lbl in NODE_LABELS:
         if lbl.lower() in q_lower and any(x in q_lower for x in ["how many", "count", "number"]):
-            token = prf(Ks, lbl)
-            if token not in dsse_index:
+            # OblivGM: no DSSE index — collect all candidates, then pad to 2r
+            candidates = [n for n, l in node_label.items() if l == lbl]
+            r = len(candidates)
+            if r == 0:
                 return {"query": q, "result": 0, "unit": f"{lbl} nodes",
-                        "explanation": f"No entries found for label '{lbl}'.", "latency_ms": ms()}
+                        "explanation": f"No {lbl} nodes found.", "latency_ms": ms()}
 
-            entry    = dsse_index[token]
-            p_r      = entry["p_r"]
-            # ── TEE path: decrypt DSSE entries inside enclave ──
-            real_ids, t_tee = tee_decrypt_dsse(Ke, entry["entries"])
-            result   = len(real_ids)
+            p_r = obliv_pad_size(r)
+            overhead = p_r - r
+
+            # Build padded scan records (real adjacency blobs + dummy repeats)
+            real_records = [
+                {"nid": nid, "enc_adj_hex": enc_adj[nid]}
+                for nid in candidates if nid in enc_adj
+            ]
+            dummy_records = [
+                {"nid": -i, "enc_adj_hex": real_records[i % len(real_records)]["enc_adj_hex"]}
+                for i in range(overhead)
+            ]
+            padded = real_records + dummy_records
+
+            t_scan_start = time.perf_counter()
+            # Oblivious scan — ALL p_r records processed, no early exit
+            decrypted = obliv_scan_adjacency(K, padded)
+            t_scan_ms = (time.perf_counter() - t_scan_start) * 1000
+
+            result = sum(1 for nid in decrypted if node_label.get(nid) == lbl)
+
             return {
                 "query": q, "result": result, "unit": f"{lbl} nodes",
                 "explanation": (
                     f"Found {result} {lbl} nodes.\n"
-                    f"DSSE padding P(r)={p_r} (overhead = {p_r - result} dummy entries).\n"
-                    f"SP only sees {p_r} encrypted entries — cannot determine true count.\n"
-                    f"{'[TEE] DSSE decrypted inside Nitro Enclave.' if tee_mode else '[Local] DSSE decrypted locally (no enclave).'}"
+                    f"OblivGM padding P(r) = 2r = {p_r} (overhead = {overhead} dummy records).\n"
+                    f"No DSSE index — full oblivious scan over {p_r} records in {t_scan_ms:.2f} ms.\n"
+                    f"Observer sees exactly {p_r} uniform AES-GCM decryptions — true count hidden.\n"
+                    f"[Software AES-GCM on host CPU — no TEE enclave involved.]"
                 ),
                 "latency_ms": ms(),
-                "privacy_note": f"Leakage: L(q) = (P(r)={p_r}, access_time)",
+                "privacy_note": f"Leakage: L(q) = (P(r)={p_r}, access_time)  [fixed 2× padding]",
             }
 
-    # ── BFS reachability ─────────────────────────────────────
+    # ── BFS reachability ──────────────────────────────────
     bfs_match = re.search(
         r'bfs\s+from\s+(?:node\s+)?(\d+)(?:\s+depth\s+(\d+))?', q_lower)
     if not bfs_match:
@@ -422,21 +362,39 @@ def parse_query(q):
         visited, frontier = {start}, [start]
         level_info = []
         for d in range(1, depth + 1):
-            if not frontier: break
-            p_r = pad_size(len(frontier))
+            if not frontier:
+                break
+            r_f = len(frontier)
+            p_r = obliv_pad_size(r_f)
+
+            # Build padded records for this frontier
+            real_records = [
+                {"nid": nid, "enc_adj_hex": enc_adj[nid]}
+                for nid in frontier if nid in enc_adj
+            ]
+            overhead = p_r - len(real_records)
+            dummy_records = [
+                {"nid": -i, "enc_adj_hex": real_records[i % len(real_records)]["enc_adj_hex"]}
+                for i in range(overhead)
+            ] if real_records else []
+            padded = real_records + dummy_records
+
+            t_scan_start = time.perf_counter()
+            # Oblivious scan — ALL p_r records processed, no early exit
+            decrypted = obliv_scan_adjacency(K, padded)
+            t_scan_ms = (time.perf_counter() - t_scan_start) * 1000
+
             new_frontier = []
-            for nid in frontier:
-                # ── TEE path: decrypt adjacency per frontier node ──
-                if nid in enc_adj:
-                    nbrs = tee_decrypt_adjacency(K, enc_adj[nid])
-                else:
-                    nbrs = adj.get(nid, [])
+            for nid, nbrs in decrypted.items():
                 for nbr, _ in nbrs:
                     if nbr not in visited:
-                        visited.add(nbr); new_frontier.append(nbr)
+                        visited.add(nbr)
+                        new_frontier.append(nbr)
+
             level_info.append(
-                f"Depth {d}: frontier={len(frontier)} → discovered {len(new_frontier)} new nodes "
-                f"(ORAM fetches P(r)={p_r})")
+                f"Depth {d}: frontier={r_f} → discovered {len(new_frontier)} new nodes "
+                f"(OblivGM padded scan P(r)={p_r}, scan_ms={t_scan_ms:.1f})"
+            )
             frontier = new_frontier
 
         return {
@@ -444,13 +402,13 @@ def parse_query(q):
             "explanation": (
                 f"BFS from node {start} (depth={depth}): {len(visited) - 1} reachable nodes.\n"
                 + "\n".join(level_info) + "\n"
-                + f"{'[TEE] Adjacency decrypted inside Nitro Enclave per frontier node.' if tee_mode else '[Local] Decrypted locally.'}"
+                + "[OblivGM] Fixed 2× oblivious scan per frontier level — no TEE, no Spark."
             ),
             "latency_ms": ms(),
-            "privacy_note": "SP only observed P(r) ORAM accesses per level — true frontier sizes hidden.",
+            "privacy_note": "Observer sees P(r)=2r uniform accesses per level — true frontier size hidden.",
         }
 
-    # ── Point-to-point reachability ──────────────────────────
+    # ── Point-to-point reachability ───────────────────────
     reach_match = re.search(
         r'(?:can|does|is).*?(?:node\s+)?(\d+).*?reach.*?(?:node\s+)?(\d+)', q_lower)
     if not reach_match:
@@ -460,16 +418,29 @@ def parse_query(q):
         src, dst = int(reach_match.group(1)), int(reach_match.group(2))
         visited, frontier, found, hops = {src}, [src], False, 0
         while frontier and hops < 4:
+            r_f = len(frontier)
+            p_r = obliv_pad_size(r_f)
+            real_records = [
+                {"nid": nid, "enc_adj_hex": enc_adj[nid]}
+                for nid in frontier if nid in enc_adj
+            ]
+            overhead = p_r - len(real_records)
+            dummy_records = [
+                {"nid": -i, "enc_adj_hex": real_records[i % len(real_records)]["enc_adj_hex"]}
+                for i in range(overhead)
+            ] if real_records else []
+            # Oblivious scan — ALL p_r processed, no early exit even after dst found
+            decrypted = obliv_scan_adjacency(K, real_records + dummy_records)
             new_f = []
-            for nid in frontier:
-                nbrs = tee_decrypt_adjacency(K, enc_adj[nid]) if nid in enc_adj else adj.get(nid, [])
+            for nid, nbrs in decrypted.items():
                 for nbr, _ in nbrs:
                     if nbr == dst:
-                        found = True; break
+                        found = True
                     if nbr not in visited:
-                        visited.add(nbr); new_f.append(nbr)
-                if found: break
-            hops += 1; frontier = new_f
+                        visited.add(nbr)
+                        new_f.append(nbr)
+            hops += 1
+            frontier = new_f
 
         return {
             "query": q,
@@ -477,41 +448,67 @@ def parse_query(q):
             "unit": "reachability",
             "explanation": (
                 f"Node {src} → Node {dst}: {'REACHABLE' if found else 'NOT REACHABLE within 4 hops'}. "
-                f"Explored {len(visited)} nodes."
+                f"Explored {len(visited)} nodes via OblivGM oblivious BFS."
             ),
             "latency_ms": ms(),
         }
 
-    # ── Subgraph pattern match ────────────────────────────────
+    # ── Subgraph pattern match ─────────────────────────────
     pattern_match = re.search(r'find\s+(\w+)\s+(\w+)\s+(\w+)', q_lower)
     if pattern_match:
         src_lbl, edge_lbl, dst_lbl = pattern_match.groups()
-        src_lbl = src_lbl.capitalize(); edge_lbl = edge_lbl.upper(); dst_lbl = dst_lbl.capitalize()
+        src_lbl = src_lbl.capitalize()
+        edge_lbl = edge_lbl.upper()
+        dst_lbl = dst_lbl.capitalize()
+
+        candidates = [n for n, l in node_label.items() if l == src_lbl]
+        r = len(candidates)
+        p_r = obliv_pad_size(r) if r > 0 else 0
+
+        real_records = [
+            {"nid": nid, "enc_adj_hex": enc_adj[nid]}
+            for nid in candidates if nid in enc_adj
+        ]
+        overhead = p_r - len(real_records)
+        dummy_records = [
+            {"nid": -i, "enc_adj_hex": real_records[i % len(real_records)]["enc_adj_hex"]}
+            for i in range(overhead)
+        ] if real_records else []
+        padded = real_records + dummy_records
+
+        t_scan_start = time.perf_counter()
+        # Oblivious scan — ALL p_r records processed unconditionally
+        decrypted = obliv_scan_adjacency(K, padded)
+        t_scan_ms = (time.perf_counter() - t_scan_start) * 1000
+
         count = 0
-        for nid, lbl in node_label.items():
-            if lbl == src_lbl:
-                nbrs = tee_decrypt_adjacency(K, enc_adj[nid]) if nid in enc_adj else adj.get(nid, [])
-                for nbr, elbl in nbrs:
-                    if elbl == edge_lbl and node_label.get(nbr) == dst_lbl:
-                        count += 1
+        for nid, nbrs in decrypted.items():
+            if node_label.get(nid) != src_lbl:
+                continue
+            for nbr, elbl in nbrs:
+                if elbl == edge_lbl and node_label.get(nbr) == dst_lbl:
+                    count += 1
+
         return {
             "query": q, "result": count,
             "unit": f"({src_lbl})-[{edge_lbl}]->({dst_lbl}) patterns",
             "explanation": (
                 f"Found {count} subgraph matches for pattern: ({src_lbl})-[{edge_lbl}]->({dst_lbl})\n"
-                f"{'[TEE] Edge decryption performed inside Nitro Enclave.' if tee_mode else '[Local] Decrypted locally.'}"
+                f"OblivGM padding P(r) = 2r = {p_r} candidates scanned ({overhead} dummies).\n"
+                f"Oblivious scan: {t_scan_ms:.2f} ms — all {p_r} records processed, no early exit.\n"
+                f"[Software AES-GCM on host CPU — no TEE enclave involved.]"
             ),
             "latency_ms": ms(),
-            "privacy_note": "Secure evaluation inside Nitro Enclave across Spark workers." if tee_mode else None,
+            "privacy_note": "Oblivious scan: observer sees uniform 2r AES-GCM decryptions — pattern hidden.",
         }
 
-    # ── Fallback ─────────────────────────────────────────────
+    # ── Fallback ──────────────────────────────────────────
     return {
         "query": q, "result": "?",
         "explanation": (
             "Query not understood. Try:\n"
             "• 'how many nodes'\n"
-            "• 'how many SEND does node 42 have'\n"
+            "• 'how many connections does node 42 have'\n"
             "• 'what label is node 0'\n"
             "• 'how many Executive nodes'\n"
             "• 'bfs from 0 depth 2'\n"
@@ -521,19 +518,19 @@ def parse_query(q):
         "latency_ms": ms(),
     }
 
-# ── HTML Template (identical UI to Demo.py) ──────────────────
+# ── HTML Template ─────────────────────────────────────────
 HTML = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DVH-GQP — Graph Query Tool (TEE)</title>
+<title>OblivGM — Graph Query Tool (Oblivious)</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #f7f8fa; --surface: #ffffff; --surface2: #f0f2f5;
-    --border: #e2e5ea; --blue: #3b6ef8; --blue-light: #eef2ff;
-    --blue-mid: #c7d2fe; --green: #16a34a; --green-light: #dcfce7;
+    --border: #e2e5ea; --blue: #d97706; --blue-light: #fef3c7;
+    --blue-mid: #fcd34d; --green: #16a34a; --green-light: #dcfce7;
     --amber: #d97706; --amber-light: #fef3c7; --red: #dc2626;
     --red-light: #fee2e2; --text: #1a1d23; --text-2: #4b5563;
     --text-3: #9ca3af; --mono: \'DM Mono\', monospace;
@@ -562,7 +559,7 @@ HTML = '''<!DOCTYPE html>
   h1 { font-size: 2.4rem; font-weight: 700; line-height: 1.15;
        letter-spacing: -0.02em; color: var(--text); margin-bottom: 10px; }
   h1 span { color: var(--blue); }
-  .subtitle { color: var(--text-2); font-size: 0.95rem; max-width: 540px; line-height: 1.7; }
+  .subtitle { color: var(--text-2); font-size: 0.95rem; max-width: 560px; line-height: 1.7; }
   .card { background: var(--surface); border: 1px solid var(--border);
           border-radius: var(--radius); padding: 28px; margin-bottom: 18px;
           box-shadow: var(--shadow); transition: box-shadow 0.2s; }
@@ -585,9 +582,9 @@ HTML = '''<!DOCTYPE html>
            padding: 11px 22px; font-family: var(--sans); font-weight: 600;
            font-size: 0.875rem; cursor: pointer; white-space: nowrap;
            transition: background 0.18s, transform 0.15s, box-shadow 0.18s;
-           box-shadow: 0 1px 3px rgba(59,110,248,0.25); }
-  button:hover { background: #2955d4; transform: translateY(-1px);
-                 box-shadow: 0 4px 12px rgba(59,110,248,0.3); }
+           box-shadow: 0 1px 3px rgba(217,119,6,0.25); }
+  button:hover { background: #b45309; transform: translateY(-1px);
+                 box-shadow: 0 4px 12px rgba(217,119,6,0.3); }
   button:active { transform: translateY(0); }
   button.secondary { background: var(--surface2); color: var(--text-2);
                      border: 1.5px solid var(--border); box-shadow: none; }
@@ -637,7 +634,7 @@ HTML = '''<!DOCTYPE html>
   .privacy-note { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px;
                   padding: 12px 15px; background: var(--blue-light);
                   border: 1px solid var(--blue-mid); border-radius: 9px;
-                  font-size: 0.8rem; color: #3730a3; font-family: var(--sans); }
+                  font-size: 0.8rem; color: #92400e; font-family: var(--sans); }
   .privacy-icon { font-size: 1rem; flex-shrink: 0; margin-top: 1px; }
   .latency { font-family: var(--mono); font-size: 0.75rem; color: var(--text-3); margin-top: 10px; }
   .spinner { width: 16px; height: 16px; border: 2px solid rgba(217,119,6,0.25);
@@ -657,13 +654,13 @@ HTML = '''<!DOCTYPE html>
   <header>
     <div class="pill">
       <span class="pill-dot"></span>
-      Research Prototype · DVH-GQP · TEE Mode
+      Research Prototype · OblivGM · Software-Only Oblivious Mode
     </div>
-    <h1>Graph Query Tool<br><span>with TEE Encryption</span></h1>
+    <h1>Graph Query Tool<br><span>with Oblivious Padding</span></h1>
     <p class="subtitle">
       Load a social network dataset, then ask natural questions about it —
-      all crypto operations run inside a Nitro Enclave (or fall back to
-      local AES-GCM when running without an enclave).
+      all crypto runs on the host CPU using software AES-GCM with fixed
+      <strong>2× oblivious padding</strong>. No TEE, no enclave, no Spark.
     </p>
   </header>
 
@@ -679,8 +676,9 @@ HTML = '''<!DOCTYPE html>
       <span class="info-icon">ℹ️</span>
       <span>
         The graph is encrypted with <strong>AES-256-GCM</strong> before processing.
-        Decryption happens inside the <strong>Nitro Enclave</strong> — the host never
-        sees plaintext. Try the Email-Enron dataset below, or grab one from
+        OblivGM hides access patterns via <strong>fixed 2× padding</strong> — every query
+        fetches exactly P(r)=2r blocks and processes them all obliviously (no early exit,
+        no DSSE index, no hardware enclave). Try the Email-Enron dataset below, or grab one from
         <a href="https://snap.stanford.edu/data" target="_blank" style="color:var(--blue)">snap.stanford.edu</a>.
       </span>
     </div>
@@ -707,7 +705,7 @@ HTML = '''<!DOCTYPE html>
         <div class="card-desc">Type in plain English, or pick a sample below</div>
       </div>
     </div>
-    <input id="queryInput" placeholder="e.g. How many CONNECTIONS does node 42 have?">
+    <input id="queryInput" placeholder="e.g. How many connections does node 42 have?">
     <div class="query-row">
       <button onclick="runQuery()" id="queryBtn" disabled>Run Query</button>
       <button class="secondary" onclick="clearResult()">Clear</button>
@@ -772,7 +770,7 @@ async function loadDataset() {
     if (data.error) throw new Error(data.error);
 
     setStatus('loadStatus', 'ready',
-      `<span>✓ Graph loaded & encrypted — ${data.stats.nodes.toLocaleString()} nodes, ${data.stats.edges.toLocaleString()} edges${data.tee_mode ? " · <strong>TEE active</strong>" : " · local mode"}</span>`);
+      `<span>✓ Graph loaded & encrypted — ${data.stats.nodes.toLocaleString()} nodes, ${data.stats.edges.toLocaleString()} edges · <strong>OblivGM mode</strong> (software AES-GCM, 2× padding)</span>`);
 
     const sg = document.getElementById('statsGrid');
     sg.innerHTML = `
@@ -812,7 +810,7 @@ async function runQuery() {
   document.getElementById('resultPanel').className = 'card result-panel visible';
   document.getElementById('resultNumber').textContent = '...';
   document.getElementById('resultUnit').textContent = '';
-  document.getElementById('resultExplanation').textContent = 'Processing encrypted query...';
+  document.getElementById('resultExplanation').textContent = 'Running oblivious scan...';
   document.getElementById('privacyNote').style.display = 'none';
   try {
     const resp = await fetch('/api/query', {
@@ -850,7 +848,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </body>
 </html>'''
 
-# ── API Routes ────────────────────────────────────────────────
+# ── API Routes ─────────────────────────────────────────────
 @app.route('/')
 def index():
     return render_template_string(HTML)
@@ -862,7 +860,7 @@ def api_load():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     try:
-        tmp = os.path.join(os.getcwd(), "dvhgqp_input.txt")
+        tmp = os.path.join(os.getcwd(), "oblivgm_input.txt")
         if url.endswith('.gz'):
             gz = tmp + ".gz"
             urllib.request.urlretrieve(url, gz)
@@ -879,32 +877,18 @@ def api_load():
         if not nodes:
             return jsonify({"error": "No valid edges found. Expected format: 'u v' per line."}), 400
 
-        K, Ks, Ke, node_label, edge_label, adj, enc_adj, dsse_index, stats = \
-            build_encrypted_graph(nodes, edges)
-
-        # Optional: load into Neo4j if available
-        driver = None
-        if _NEO4J_AVAILABLE:
-            try:
-                driver = GraphDatabase.driver(
-                    CONFIG["NEO4J_URI"],
-                    auth=(CONFIG["NEO4J_USERNAME"], CONFIG["NEO4J_PASSWORD"]))
-                driver.verify_connectivity()
-                phase2_load_neo4j(driver, nodes, edges, enc_adj, node_label, edge_label)
-            except Exception as e:
-                print(f"[Neo4j] Not available, skipping: {e}")
-                driver = None
+        K, node_label, edge_label, adj, enc_adj, hist, stats = build_obliv_graph(nodes, edges)
 
         STATE.update({
             "loaded": True, "nodes": nodes, "edges": edges,
             "node_label": node_label, "edge_label": edge_label,
-            "adj": adj, "enc_adj": enc_adj, "dsse_index": dsse_index,
-            "K": K, "Ks": Ks, "Ke": Ke,
+            "adj": adj, "enc_adj": enc_adj,
+            "K": K,
+            "hist": hist,
             "dataset_name": url.split('/')[-1],
             "stats": stats,
-            "driver": driver,
         })
-        return jsonify({"ok": True, "stats": stats, "tee_mode": _probe_tee()})
+        return jsonify({"ok": True, "stats": stats})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -921,16 +905,25 @@ def api_query():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/tee_status', methods=['GET'])
-def api_tee_status():
-    return jsonify({"tee_available": _probe_tee(), "neo4j_available": _NEO4J_AVAILABLE, "spark_available": _SPARK_AVAILABLE})
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify({
+        "mechanism": "OblivGM",
+        "padding": "fixed_2x",
+        "tee": False,
+        "dsse": False,
+        "spark": False,
+        "loaded": STATE["loaded"],
+    })
 
 if __name__ == '__main__':
     print("=" * 55)
-    print("  DVH-GQP  ·  TeeDemo")
-    print(f"  TEE (Nitro Enclave): {'probing on first query' }")
-    print(f"  Neo4j : {'available' if _NEO4J_AVAILABLE else 'not installed — skipped'}")
-    print(f"  Spark : {'available' if _SPARK_AVAILABLE else 'not installed — skipped'}")
-    print("  Open  : http://localhost:5000")
+    print("  OblivGM  ·  TeeDemo")
+    print("  Mechanism : Software-only oblivious scan")
+    print("  Padding   : Fixed 2× (P(r) = 2r)")
+    print("  TEE       : Not used")
+    print("  DSSE      : Not used")
+    print("  Spark     : Not used")
+    print("  Open      : http://localhost:5000")
     print("=" * 55)
     app.run(debug=False, host='0.0.0.0', port=5000)

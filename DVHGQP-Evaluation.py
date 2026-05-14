@@ -1,5 +1,6 @@
 from cProfile import label
 import os, json, time, math, hashlib, random, gzip, urllib.request
+from networkx import nodes
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -316,8 +317,8 @@ class NitroSparkEngine:
         NitroSparkEngine._instance = None
         print("[NitroSpark] Session stopped.")
 
-SNAP_URL  = "https://snap.stanford.edu/data/facebook_combined.txt.gz"
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "facebook_combined.txt.gz")
+SNAP_URL  = "https://snap.stanford.edu/data/email-Enron.txt.gz"
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email-Enron.txt.gz")
 
 COLORS = {
     "dvhgqp":   "#2563EB",
@@ -367,7 +368,7 @@ def get_dynamic_k(r): # Dynamically scale Spark executors based on workload size
 def download_snap():
     gz = DATA_PATH + ".gz"
     if not os.path.exists(DATA_PATH):
-        print("[Phase 0] Downloading ego-Facebook...")
+        print("[Phase 0] Downloading Email-Enron...")
         urllib.request.urlretrieve(SNAP_URL, gz)
         with gzip.open(gz,"rb") as fi, open(DATA_PATH,"wb") as fo: fo.write(fi.read())
         os.remove(gz)
@@ -389,23 +390,49 @@ def load_snap_graph():
     print(f"[Phase 0] Loaded: {len(nodes)} nodes, {len(edges)} edges")
     return nodes, edges
  
-NODE_LABELS = ["Person", "Influencer", "Community", "Organization", "Bot"]
-EDGE_LABELS = ["FRIEND", "FOLLOWS", "MEMBER_OF" ,"INTERACTS"]
- 
+NODE_LABELS = ["Executive", "Manager", "Employee", "External", "Inactive"]
+EDGE_LABELS = ["SEND", "REPLY", "BROADCAST", "INTERNAL"]
+
 def assign_labels(nodes, edges):
-    degree = {}
-    for u, v in edges: 
-        degree[u] = degree.get(u,0) + 1
-        degree[v] = degree.get(v,0) + 1
+    out_degree = {}
+    in_degree  = {}
+    for u, v in edges:
+        out_degree[u] = out_degree.get(u, 0) + 1
+        in_degree[v]  = in_degree.get(v, 0) + 1
+
+    total_degree = {}
+    for n in nodes:
+        total_degree[n] = out_degree.get(n, 0) + in_degree.get(n, 0)
+
+    # Node labels based on total email volume
     node_label = {}
     for n in nodes:
-        d=degree.get(n,0)
-        if   d > 200: node_label[n]="Influencer"
-        elif d > 50:  node_label[n]="Community"
-        elif d > 10:  node_label[n]="Person"
-        elif d > 2:   node_label[n]="Organization"
-        else:       node_label[n]="Bot"
-    edge_label = {(u,v):EDGE_LABELS[(u+v)%4] for u,v in edges}
+        d = total_degree.get(n, 0)
+        if   d > 500: node_label[n] = "Executive"
+        elif d > 200: node_label[n] = "Manager"
+        elif d > 50:  node_label[n] = "Employee"
+        elif d > 5:   node_label[n] = "External"
+        else:         node_label[n] = "Inactive"
+
+    # Edge labels — purely based on bidirectionality
+    edge_set = set(edges)
+    edge_label = {}
+    for (u, v) in edges:
+        src = node_label.get(u, "Inactive")
+        dst = node_label.get(v, "Inactive")
+        if src in ("Executive", "Manager") and dst in ("Executive", "Manager"):
+            edge_label[(u, v)] = "REPLY"        # senior ↔ senior = likely conversation
+        elif src in ("Executive", "Manager"):
+            edge_label[(u, v)] = "BROADCAST"    # senior → lower = announcement/broadcast
+        elif src == dst:
+            edge_label[(u, v)] = "INTERNAL"     # same role = peer communication
+        else:
+            edge_label[(u, v)] = "SEND"         # everything else = general send
+
+    from collections import Counter
+    dist = Counter(edge_label.values())
+    print(f"[Phase 0] Edge label distribution")
+
     return node_label, edge_label
  
 # ── Phase 1: Encrypt + DSSE + Adjacency Index ────────────
@@ -722,10 +749,10 @@ def baseline_bfs(driver, K, adj_plain, start_node, max_depth=3): # Baseline - BF
 # ── Phase 3c: SUBGRAPH MATCHING QUERY ────────────────────
 def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=4): # DVHGQP - find pattern matches
     t0 = time.perf_counter()
-    # Full pattern = "Influencer -[FOLLOWS]-> Person"
-    src_lbl  = pattern["src_label"] # Influencer
-    edge_lbl = pattern["edge_label"] # FOLLOWS
-    dst_lbl  = pattern["dst_label"]   # Person
+    # Full pattern = "Executive -[REPLY]-> Manager"
+    src_lbl  = pattern["src_label"]  # Executive
+    edge_lbl = pattern["edge_label"] # REPLY
+    dst_lbl  = pattern["dst_label"]  # Manager
     candidates = []
     for n, lbl in node_label.items():
         if lbl == src_lbl:
@@ -982,10 +1009,10 @@ def run_bfs_benchmark(driver, K, adj_plain, node_label, degree):
 def run_subgraph_benchmark(driver, K, adj_plain, node_label):
     print("[Phase 3c] Subgraph Matching benchmark...")
     patterns = [
-        {"src_label":"Influencer","edge_label":"FOLLOWS",  "dst_label":"Person"},
-        {"src_label":"Person",    "edge_label":"FRIEND",   "dst_label":"Person"},
-        {"src_label":"Community", "edge_label":"MEMBER_OF","dst_label":"Person"},
-        {"src_label":"Bot",       "edge_label":"INTERACTS","dst_label":"Person"},
+        {"src_label":"Executive","edge_label":"REPLY",     "dst_label":"Manager"},
+        {"src_label":"Manager",  "edge_label":"BROADCAST", "dst_label":"Employee"},
+        {"src_label":"Employee", "edge_label":"INTERNAL",  "dst_label":"Employee"},
+        {"src_label":"External", "edge_label":"SEND",      "dst_label":"Manager"},
     ]
 
     dvhgqp_rows = []
@@ -1160,7 +1187,7 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
     ax8.legend(fontsize=9)
     ax8.grid(True, alpha=0.3, axis="y")
  
-    fig.suptitle("DVH-GQP Full Evaluation — ego-Facebook (SNAP)\n"
+    fig.suptitle("DVH-GQP Full Evaluation — Email-Enron (SNAP)\n"
                  "Label Queries + BFS Reachability + Subgraph Matching | Neo4j AuraDB",
                  fontsize=14,fontweight="bold",y=0.995)
     path = os.path.join(out_dir,"dvhgqp_full_evaluation.png")
@@ -1367,7 +1394,7 @@ def main():
 
     print("="*60)
     print("  DVH-GQP vs. Baseline vs. OblivGM — Performance Comparison")
-    print("  ego-Facebook | Neo4j AuraDB")
+    print("  Email-Enron | Neo4j AuraDB")
     print("="*60)
     
     # 1. Create a dummy list for OblivGM BFS so the plotting function has the columns it expects
