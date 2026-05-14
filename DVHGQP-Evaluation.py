@@ -1,6 +1,4 @@
-from cProfile import label
 import os, json, time, math, hashlib, random, gzip, urllib.request
-from networkx import nodes
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -146,7 +144,8 @@ class NitroSparkEngine:
         K_hex      = K.hex()
         cid        = ENCLAVE_CID
         port       = ENCLAVE_PORT
-        # Broadcast visited as a frozenset — serialised once, cached per executor
+        
+        # broadcast visited once before the job and unpersist immediately after — previously visited was re-broadcast
         visited_bc = self.sc.broadcast(frozenset(visited))
 
         # Partition the frontier records across k executors
@@ -182,6 +181,8 @@ class NitroSparkEngine:
         t0 = time.perf_counter()
         raw: list = rdd.mapPartitions(worker_task).distinct().collect()
         t_spark_ms = (time.perf_counter() - t0) * 1000
+
+        visited_bc.unpersist()  # free executor memory — don't leak broadcasts
 
         # Belt-and-braces: drop anything already in visited
         new_frontier = [n for n in raw if n not in visited]
@@ -249,6 +250,8 @@ class NitroSparkEngine:
         t0 = time.perf_counter()
         matches: list = rdd.mapPartitions(worker_task).collect()
         t_spark_ms = (time.perf_counter() - t0) * 1000
+
+        node_label_bc.unpersist() # free executor memory — don't leak broadcasts
 
         return matches, t_spark_ms
 
@@ -352,7 +355,7 @@ def prf(ks, w):
 
 def pad_size(r): # Adaptive padding strategy based on result size r 
     if    r == 0:   return 0
-    if    r < 1000: ratio = 0.25 #small
+    if    r < 1000: ratio = 0.20 #small
     elif  r < 5000: ratio = 0.15 #medium
     else:           ratio = 0.10 #large
         
@@ -592,7 +595,10 @@ def phase2_load_neo4j(driver, enc_nodes, enc_edges, enc_adj):
             print(f"          Nodes: {min(i+bs,len(node_list))}/{len(node_list)}", end="\r")
         print(f"\n          Loaded {len(enc_nodes)} nodes.")
         # Create index on node_id for fast lookup later
-        session.run("CREATE INDEX enc_node_id IF NOT EXISTS FOR (n:EncNode) ON (n.node_id)")
+        session.run("""
+            CREATE INDEX enc_node_dataset IF NOT EXISTS
+            FOR (n:EncNode) ON (n.dataset_id, n.node_id)
+        """)        
         edge_list = list(enc_edges.items())
         for i in range(0, len(edge_list), bs):
             chunk = edge_list[i : i+bs]
@@ -682,14 +688,30 @@ def bfs_query(driver, K, adj_plain, start_node, max_depth=3, k=4): # DVHGQP - BF
             for rec in records
         ]
 
-        # REAL NitroSpark: each Spark worker ships its shard to the local
-        # Nitro Enclave via AF_VSOCK. The enclave decrypts + expands BFS
-        # neighbours and returns only the new frontier IDs. t_tee is the
-        # per-enclave decrypt cost measured inside the worker; t_spark is
-        # the full distributed job wall-clock time measured on the driver.
-        new_frontier, t_spark = NitroSparkEngine.get().nitro_bfs_frontier(
-            rec_list, visited, frontier, K, k
-        )
+        # for k=1, bypass Spark entirely
+        if k == 1:
+            t0_spark = time.perf_counter()
+            raw_result = _vsock_call(
+                op      = "decrypt_adjacency",
+                payload = {"key_hex": K.hex(), "records": rec_list},
+                cid     = ENCLAVE_CID,
+                port    = ENCLAVE_PORT,
+            )
+            new_frontier_set = set()
+            for nid_str, nbr_list in raw_result["neighbors"].items():
+                for nbr_edge in nbr_list:
+                    nbr = nbr_edge[0]
+                    if nbr not in visited:
+                        new_frontier_set.add(nbr)
+            new_frontier = list(new_frontier_set)
+            t_spark = (time.perf_counter() - t0_spark) * 1000
+        else:
+            # Spark is only needed for k > 1.
+            # REAL NitroSpark: each Spark worker ships its shard to the local
+            new_frontier, t_spark = NitroSparkEngine.get().nitro_bfs_frontier(
+                rec_list, visited, frontier, K, k
+            )
+
         # t_tee is now accounted for inside the Spark job (enclave-side).
         # We record it as 0 on the driver to avoid double-counting.
         t_tee = 0.0
@@ -707,7 +729,7 @@ def bfs_query(driver, K, adj_plain, start_node, max_depth=3, k=4): # DVHGQP - BF
                             "t_level_ms":round(t_neo4j+t_tee+t_spark,2)})
         frontier = new_frontier    # move to next level
  
-    t_total = (time.perf_counter() - t0_total) * 1000 + t_spark_tot  # fix: include spark total
+    t_total = (time.perf_counter() - t0_total) * 1000 
     return {"start_node":start_node, "max_depth":max_depth, "k":k,
             "total_visited":len(visited),  "t_neo4j_ms":round(t_neo4j_tot,2),
             "t_tee_ms":round(t_tee_tot,2), "t_spark_ms":round(t_spark_tot,2),
@@ -747,7 +769,7 @@ def baseline_bfs(driver, K, adj_plain, start_node, max_depth=3): # Baseline - BF
             "t_total_ms": round(t_total,2)}
 
 # ── Phase 3c: SUBGRAPH MATCHING QUERY ────────────────────
-def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=4): # DVHGQP - find pattern matches
+def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=None): # DVHGQP - find pattern matches
     t0 = time.perf_counter()
     # Full pattern = "Executive -[REPLY]-> Manager"
     src_lbl  = pattern["src_label"]  # Executive
@@ -761,7 +783,8 @@ def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=4): # DVHG
 
     p_r = pad_size(r)
 
-    k = get_dynamic_k(r)
+    if k is None:
+        k = get_dynamic_k(r)
 
     t_dsse = 0.001   # assumes DSSE token lookup is near-instant
 
@@ -782,7 +805,7 @@ def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=4): # DVHG
     )
     t_tee = 0.0   # measured inside enclave per-worker; not double-counted here
 
-    t_total = (time.perf_counter() - t0) * 1000 + t_spark
+    t_total = (time.perf_counter() - t0) * 1000
  
     return {"pattern":f"{src_lbl}-[{edge_lbl}]->{dst_lbl}",
             "candidates":r, "p_r":p_r, "matches":len(matches), "k":k,
@@ -928,6 +951,7 @@ def run_label_query(driver, dsse_index, Ks, Ke, K, label, k=4): #  Find all node
             "blocks_fetched":len(records)}
  
 def run_label_benchmark(driver, dsse_index, Ks, Ke, K, hist):
+    print("[Phase 3] k = number of parallel Spark workers.")
     print("[Phase 3a] Label lookup benchmark...")
     results = []
     for label in hist:
