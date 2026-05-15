@@ -92,37 +92,40 @@ def _vsock_call(op, payload, cid=None, port=None):
 _TEE_AVAILABLE = None   # None = not yet probed
 
 def _probe_tee():
-    """Try a ping to the enclave; cache the result."""
     global _TEE_AVAILABLE
     if _TEE_AVAILABLE is not None:
         return _TEE_AVAILABLE
     try:
-        _vsock_call("ping", {})
+        import socket as _socket
+        s = _socket.socket(_socket.AF_VSOCK, _socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((ENCLAVE_CID, ENCLAVE_PORT))
+        s.close()
         _TEE_AVAILABLE = True
-    except Exception:
+    except Exception as e:
+        print(f"[TEE probe failed]: {type(e).__name__}: {e}")
         _TEE_AVAILABLE = False
     return _TEE_AVAILABLE
 
 # ── TEE operations with local fallback ──────────────────────
 def tee_decrypt_adjacency(K: bytes, enc_adj_hex: str) -> list:
-    """Decrypt one adjacency list.  TEE if available, else local AES-GCM."""
     if _probe_tee():
-        result = _vsock_call("decrypt_adjacency_single",
-                             {"key_hex": K.hex(), "enc_adj_hex": enc_adj_hex})
-        return result["neighbors"]
-    # local fallback
+        result = _vsock_call("decrypt_adjacency",
+                             {"key_hex": K.hex(),
+                              "records": [{"nid": 0, "adj_ct": enc_adj_hex}]})
+        neighbors = result.get("neighbors", {})
+        # enclave returns {nid: [[nbr, edge_label], ...]}
+        nbr_list = list(neighbors.values())[0] if neighbors else []
+        return nbr_list
     return json.loads(aes_gcm_decrypt(K, bytes.fromhex(enc_adj_hex)).decode())
 
 def tee_decrypt_dsse(Ke: bytes, entries: list) -> list:
-    """Decrypt DSSE entries and return real (non-dummy) ids.
-    TEE if available, else local AES-GCM."""
     t0 = time.perf_counter()
     if _probe_tee():
         result = _vsock_call("decrypt_dsse",
-                             {"key_hex": Ke.hex(), "entries": entries})
+                             {"ke_hex": Ke.hex(), "entries": entries})
         real_ids = result["real_ids"]
     else:
-        # local fallback
         real_ids = []
         for hex_blob in entries:
             parsed = json.loads(aes_gcm_decrypt(Ke, bytes.fromhex(hex_blob)).decode())
@@ -253,7 +256,7 @@ def phase2_load_neo4j(driver, nodes, edges, enc_adj, node_label, edge_label):
     bs = CONFIG["BATCH_SIZE"]
     node_list = list(nodes)
     with driver.session() as session:
-        session.run("MATCH (n:EncNode {dataset_id:$ds}) DETACH DELETE n", ds=DATASET_ID)
+        session.run("MATCH (n) DETACH DELETE n")
 
         # Load nodes
         for i in range(0, len(node_list), bs):
@@ -453,8 +456,7 @@ def parse_query(q):
             "result": "YES" if found else "NO (within 4 hops)",
             "unit": "reachability",
             "explanation": (
-                f"Node {src} → Node {dst}: {'REACHABLE' if found else 'NOT REACHABLE within 4 hops'}. "
-                f"Explored {len(visited)} nodes."
+                f"Node {src} → Node {dst}: {'REACHABLE. Within ' + str(hops) + ' hops.' if found else 'NOT REACHABLE within 4 hops.'}"
             ),
             "latency_ms": ms(),
         }

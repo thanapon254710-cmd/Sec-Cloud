@@ -144,7 +144,7 @@ def assign_labels(nodes, edges):
 
     from collections import Counter
     dist = Counter(edge_label.values())
-    print(f"[Phase 0] Edge label distribution: {dict(dist)}")
+    print(f"[Phase 0] Edge label distribution:")
 
     return node_label, edge_label, degree
 
@@ -447,8 +447,7 @@ def parse_query(q):
             "result": "YES" if found else "NO (within 4 hops)",
             "unit": "reachability",
             "explanation": (
-                f"Node {src} → Node {dst}: {'REACHABLE' if found else 'NOT REACHABLE within 4 hops'}. "
-                f"Explored {len(visited)} nodes via OblivGM oblivious BFS."
+                f"Node {src} → Node {dst}: {'REACHABLE. Within ' + str(hops) + ' hops.' if found else 'NOT REACHABLE within 4 hops.'}"
             ),
             "latency_ms": ms(),
         }
