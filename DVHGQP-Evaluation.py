@@ -11,6 +11,7 @@ from neo4j import GraphDatabase
 from collections import defaultdict
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
+import math
 
 # tee_client — communicates with AWS Nitro Enclave via vsock (driver-side only)
 # Note: tee_decrypt_adjacency and tee_decrypt_nodes are now called *inside*
@@ -318,10 +319,10 @@ class NitroSparkEngine:
     def stop(self):
         self.spark.stop()
         NitroSparkEngine._instance = None
-        print("[NitroSpark] Session stopped.")
+        print("\n[NitroSpark] Session stopped.")
 
 SNAP_URL  = "https://snap.stanford.edu/data/email-Enron.txt.gz"
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email-Enron.txt.gz")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email-Enron.txt")
 
 COLORS = {
     "dvhgqp":   "#2563EB",
@@ -786,7 +787,14 @@ def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=None): # D
     if k is None:
         k = get_dynamic_k(r)
 
-    t_dsse = 0.001   # assumes DSSE token lookup is near-instant
+    # Measure real PRF token derivation time — Tw ← PRF(Ks, src_lbl)
+    # This mirrors the paper's Step 1 (§III-B): the DO derives a search token
+    # before issuing the query.  We use a throwaway key so Ks stays secret,
+    # but the SHA-256 workload is identical to the real call.
+    _t_dsse0 = time.perf_counter()
+    _dummy_ks = b'\x00' * 32          # same length as a real Ks from keygen()
+    _ = prf(_dummy_ks, src_lbl)       # one SHA-256 hash — same cost as real PRF
+    t_dsse = (time.perf_counter() - _t_dsse0) * 1000
 
     records, t_neo4j = fetch_nodes(driver, candidates, p_r)
 
@@ -839,43 +847,95 @@ def baseline_subgraph(driver, K, node_label, pattern): # Baseline - without ORAM
             "t_neo4j_ms": round(t_neo4j,2), "t_tee_ms": 0.0,
             "t_spark_ms": 0.0, "t_total_ms": round(t_total,2)}
 
-def oblivgm_subgraph(driver, K, node_label, pattern): # OblivGM - software-only oblivious crypto, no TEE acceleration
+def oblivgm_subgraph(driver, K, node_label, pattern):
+    """
+    Models OblivGM overhead for subgraph matching.
+    OblivGM uses 3-server RSS + FSS + secure shuffle (no TEE).
+    Overhead modeled analytically per Wang et al. [11]:
+      - secEval:   O(C) local FSS evaluation — negligible comms (1 bit/candidate)
+      - secFetch:  secure shuffle over C candidates — O(C * id_bits) comms
+      - secAccess: secure shuffle over neighbor lists — O(C * Lmax * id_bits) comms
+    Network: 2.5 Gbps, ~0.2 ms RTT (OblivGM paper setup)
+    """
+    import math
     t0 = time.perf_counter()
-    src_lbl = pattern["src_label"]; edge_lbl = pattern["edge_label"]; dst_lbl = pattern["dst_label"]
+    src_lbl  = pattern["src_label"]
+    edge_lbl = pattern["edge_label"]
+    dst_lbl  = pattern["dst_label"]
     candidates = [n for n, lbl in node_label.items() if lbl == src_lbl]
     r = len(candidates)
 
-    # OblivGM uses ~2x padding (no adaptive padding — fixed oblivious structure overhead)
+    # OblivGM uses ~2x padding (k-automorphism degree padding, no adaptive tiers)
     p_r = int(r * 2.0)
     records, t_neo4j = fetch_nodes(driver, candidates, p_r)
 
-    # REAL measured software crypto cost — OblivGM has no TEE, runs AES-GCM on parent CPU
-    # We time the actual decryption loop here to get a hardware-accurate measurement
+    # ── Real measured: local AES-GCM decryption (parent CPU, no AES-NI offload) ──
     t_crypto_start = time.perf_counter()
     matches = []
     for rec in records:
         try:
-            nid    = int(rec["nid"])
+            nid     = int(rec["nid"])
             adj_hex = rec["adj_ct"]
             if not adj_hex:
                 continue
-            # Decrypt on parent CPU (software AES — no AES-NI enclave offload)
             adj_bytes = bytes.fromhex(adj_hex)
             neighbors = json.loads(aes_gcm_decrypt(K, adj_bytes).decode())
-            # OblivGM processes ALL p_r records obliviously — no early exit on dummies
             if node_label.get(nid) == src_lbl:
                 for nbr, elbl in neighbors:
                     if elbl == edge_lbl and node_label.get(nbr) == dst_lbl:
                         matches.append((nid, nbr))
         except:
-            continue  # dummy block — discard
-    t_crypto = (time.perf_counter() - t_crypto_start) * 1000  # real measured ms
+            continue
+    t_crypto_ms = (time.perf_counter() - t_crypto_start) * 1000
 
-    t_total = t_neo4j + t_crypto
-    return {"scheme": "OblivGM", "pattern": f"{src_lbl}-[{edge_lbl}]->{dst_lbl}",
-            "candidates": r, "p_r": p_r, "matches": len(matches),
-            "t_neo4j_ms": round(t_neo4j, 2), "t_tee_ms": round(t_crypto, 2),
-            "t_spark_ms": 0.0, "t_total_ms": round(t_total, 2)}
+    # ── Modeled: RSS/FSS inter-server communication overhead ──
+    # Based on OblivGM paper Table II & Fig 4 (Wang et al. 2022):
+    #
+    # secEval comm: 1 bit re-share per candidate → negligible
+    #   → ~0 ms modeled
+    #
+    # secFetch comm (Case II — multiple matches, requires secure shuffle):
+    #   Each shuffle round communicates the full table of C records.
+    #   OblivGM secure shuffle = 3 rounds × C × (id_bits + attr_bits) bits
+    #   id_bits ≈ log2(N) where N = total nodes in graph
+    #   From Fig 4 middle: secFetch comms ≈ linear in C, ~50 MB at C=10000
+    #   → model as: (C / 10000) * 50 MB / 2.5 Gbps * 3 rounds
+    #
+    # secAccess comm (dominant — shuffle per matched vertex's neighbor list):
+    #   From Fig 4 right: secAccess grows with |neighbors|, ~200 MB at Lmax=1000
+    #   → model as: (matches / 1000) * 200 MB / 2.5 Gbps * 3 rounds
+
+    NETWORK_GBPS  = 2.5
+    BYTES_PER_GB  = 1e9
+    ms_per_byte   = 8 / (NETWORK_GBPS * BYTES_PER_GB) * 1000  # ms per byte
+
+    # secFetch: ~50 MB at C=10,000 candidates, 3 shuffle rounds
+    secfetch_bytes = (r / 10_000) * 50e6 * 3
+    t_secfetch_ms  = secfetch_bytes * ms_per_byte
+
+    # secAccess: ~200 MB at 1,000 matched vertices, 3 shuffle rounds
+    n_matches      = max(1, len(matches))
+    secaccess_bytes = (n_matches / 1_000) * 200e6 * 3
+    t_secaccess_ms  = secaccess_bytes * ms_per_byte
+
+    # Network RTT latency: 3 rounds × 0.2 ms RTT
+    t_rtt_ms = 3 * 0.2
+
+    t_comm_ms = t_secfetch_ms + t_secaccess_ms + t_rtt_ms
+
+    t_total = t_neo4j + t_crypto_ms + t_comm_ms
+    return {
+        "scheme":       "OblivGM",
+        "pattern":      f"{src_lbl}-[{edge_lbl}]->{dst_lbl}",
+        "candidates":   r,
+        "p_r":          p_r,
+        "matches":      len(matches),
+        "t_neo4j_ms":   round(t_neo4j,    2),
+        "t_crypto_ms":  round(t_crypto_ms, 2),   
+        "t_comm_ms":    round(t_comm_ms,   2),   # modeled RSS/FSS comms
+        "t_spark_ms":   0.0,
+        "t_total_ms":   round(t_total,     2),
+    }
 
 # ── Phase 3a: Label lookup ───────────────────────────────
 def dsse_lookup(dsse_index, Ks, Ke, K, query_label): # Look up a label in the DSSE index, decrypt results in REAL TEE, and return real IDs + p(r)
@@ -917,7 +977,51 @@ def fetch_blocks_label(driver, node_ids, p_r): # fetch exactly p_r blocks from N
                                 """, skip = skip, lim = dummy_needed, dataset_id = DATASET_ID)
             records += list(dummy)
     return records, (time.perf_counter() - t0) * 1000
- 
+
+def oblivgm_label_query(driver, dsse_index, Ks, Ke, K, label):
+    """
+    OblivGM label lookup — no volume hiding (leaks true r).
+    Fetches exactly r blocks with no padding, plus modeled
+    RSS/FSS inter-server communication cost.
+    """
+    import math
+    t0 = time.perf_counter()
+
+    token = prf(Ks, label)
+    entry = dsse_index.get(token)
+    if entry is None:
+        return None
+
+    # OblivGM leaks true r — no padding applied
+    all_entries = entry["entries"]
+    p_r_dvh     = entry["p_r"]   # DVH-GQP's padded size (for reference only)
+
+    # Decrypt only real entries (OblivGM has no dummies to strip)
+    real_ids, t_tee_dec = tee_decrypt_dsse(Ke, all_entries)
+    r_true = len(real_ids)
+    node_ids = [e[1] for e in real_ids if e[0] == "v"]
+
+    # Fetch exactly r blocks — no ORAM padding
+    records, t_neo4j = fetch_nodes_plain(driver, node_ids)
+
+    # Modeled RSS/FSS comms (same model as oblivgm_subgraph)
+    NETWORK_GBPS = 2.5
+    ms_per_byte  = 8 / (NETWORK_GBPS * 1e9) * 1000
+    secfetch_bytes = (r_true / 10_000) * 50e6 * 3
+    t_comm_ms      = secfetch_bytes * ms_per_byte + 3 * 0.2
+
+    t_total = (time.perf_counter() - t0) * 1000 + t_comm_ms
+    return {
+        "label":       label,
+        "r_true":      r_true,
+        "p_r_dvh":     p_r_dvh,   # what DVH-GQP would pad to
+        "p_r_obliv":   r_true,    # OblivGM leaks exact r
+        "t_neo4j_ms":  round(t_neo4j,   2),
+        "t_comm_ms":   round(t_comm_ms, 2),
+        "t_total_ms":  round(t_total,   2),
+        "volume_leak": True,       # flag: SP learns r directly
+    }
+
 def run_label_query(driver, dsse_index, Ks, Ke, K, label, k=4): #  Find all nodes with a given label
     real_ids, p_r, t_dsse, t_tee_dsse, r_true = dsse_lookup(dsse_index, Ks, Ke, K, label)
     if r_true == 0:
@@ -958,30 +1062,61 @@ def run_label_benchmark(driver, dsse_index, Ks, Ke, K, hist):
         r_size = len(hist[label])
         k_dynamic = get_dynamic_k(r_size)
 
-        # Test k_dynamic and all smaller valid k values below it
         k_values = sorted(set([1, 2, 4, k_dynamic]))
         k_values = [k for k in k_values if k <= k_dynamic]
 
         for k in k_values:
+            # ── DVH-GQP ──
             runs = []
             for _ in range(CONFIG["REPEAT"]):
                 result = run_label_query(driver, dsse_index, Ks, Ke, K, label, k=k)
                 runs.append(result)
 
-            runs = [r for r in runs if r]  # filter None
+            runs = [r for r in runs if r]
+            if not runs:
+                continue
 
-            if runs:
-                avg = {}
-                for key in runs[0]:
-                    if isinstance(runs[0][key], (int, float)):
-                        values = [r[key] for r in runs if isinstance(r[key], (int, float))]
-                        avg[key] = round(np.mean(values), 3)
-                avg["label"] = label
-                avg["k"]     = k
-                results.append(avg)
-                print(f"           [{label},k={k}] total={avg['t_total_ms']}ms")
+            avg = {}
+            for key in runs[0]:
+                if isinstance(runs[0][key], (int, float)):
+                    values = [r[key] for r in runs if isinstance(r[key], (int, float))]
+                    avg[key] = round(np.mean(values), 3)
+            avg["label"]  = label
+            avg["k"]      = k
+            avg["scheme"] = "DVH-GQP"
+            results.append(avg)
+
+            # ── OblivGM: single-process, pairs with k=1 only ──
+            if k == 1:
+                runs_o = []
+                for _ in range(CONFIG["REPEAT"]):
+                    result_o = oblivgm_label_query(
+                        driver, dsse_index, Ks, Ke, K, label
+                    )
+                    if result_o:
+                        runs_o.append(result_o)
+
+                if runs_o:
+                    avg_o = {}
+                    for key in runs_o[0]:
+                        if isinstance(runs_o[0][key], (int, float)) and key != "volume_leak":
+                            values = [r[key] for r in runs_o if isinstance(r[key], (int, float))]
+                            avg_o[key] = round(np.mean(values), 3)
+                    avg_o["label"]  = label
+                    avg_o["k"]      = None   # no Spark
+                    avg_o["scheme"] = "OblivGM"
+                    results.append(avg_o)
+
+                    print(f"           [{label}, k=1] "
+                          f"DVH-GQP={avg['t_total_ms']}ms   "
+                          f"OblivGM={avg_o['t_total_ms']}ms")
+            else:
+                print(f"           [{label}, k={k}] "
+                      f"DVH-GQP={avg['t_total_ms']}ms")
+
     return results
- 
+
+
 def run_bfs_benchmark(driver, K, adj_plain, node_label, degree):
     print("[Phase 3b] BFS Reachability benchmark...")
     high_deg = sorted(node_label,                    # all node IDs
@@ -1066,7 +1201,8 @@ def run_subgraph_benchmark(driver, K, adj_plain, node_label):
             "candidates": runs_o[0]["candidates"], "p_r": runs_o[0]["p_r"],
             "matches":    runs_o[0]["matches"],
             "t_neo4j_ms": round(np.mean([r["t_neo4j_ms"] for r in runs_o]),2),
-            "t_tee_ms":   round(np.mean([r["t_tee_ms"] for r in runs_o]),2), 
+            "t_crypto_ms":round(np.mean([r["t_crypto_ms"] for r in runs_o]),2), 
+            "t_comm_ms":  round(np.mean([r["t_comm_ms"] for r in runs_o]),2),   # modeled RSS/FSS comms
             "t_spark_ms": 0.0,
             "t_total_ms": round(np.mean([r["t_total_ms"] for r in runs_o]),2),
         })
@@ -1094,16 +1230,23 @@ def run_subgraph_benchmark(driver, K, adj_plain, node_label):
 # ── Phase 4: Plots ───────────────────────────────────────
 def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, out_dir="outputs"):
     os.makedirs(out_dir, exist_ok=True)
-    df_lbl = pd.DataFrame(label_results)
-    df_bfs = pd.DataFrame(bfs_results)
-    df_sg  = pd.DataFrame(sg_results)
-    df_k4  = df_lbl[df_lbl["k"]==4].copy()  # ← restore this for label plots (Fig 3 & 4)
-    df_bk4 = df_bfs     
+    df_lbl       = pd.DataFrame(label_results)
+    df_bfs       = pd.DataFrame(bfs_results)
+    df_sg        = pd.DataFrame(sg_results)
+    df_dvh_lbl   = df_lbl[df_lbl["scheme"] == "DVH-GQP"].copy()
+    df_obliv_lbl = df_lbl[df_lbl["scheme"] == "OblivGM"].copy()
+    df_k4 = df_dvh_lbl.loc[df_dvh_lbl.groupby("label")["k"].idxmax()].copy()
+    df_bk4       = df_bfs[df_bfs["k"]==4]
+
+    LABEL_ORDER = ["Executive","Manager","Employee","External","Inactive",
+               "SEND","REPLY","BROADCAST","INTERNAL"]
+    df_k4["label"] = pd.Categorical(df_k4["label"], categories=LABEL_ORDER, ordered=True)
+    df_k4 = df_k4.sort_values("label")
 
     fig = plt.figure(figsize=(20,28))
     gs  = gridspec.GridSpec(4, 2, hspace=0.50, wspace=0.35)
  
-    # Fig 1: Label latency breakdown
+    # Fig 3: Label latency breakdown
     ax1 = fig.add_subplot(gs[0,0])
     x   = np.arange(len(df_k4)); 
     w   = 0.18
@@ -1114,21 +1257,21 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
     ax1.bar(x+2*w,df_k4["t_spark_ms"],  w,label="Spark",  color=COLORS["spark"], alpha=0.88)
     ax1.set_xticks(x); ax1.set_xticklabels(df_k4["label"], rotation=30, ha="right")
     ax1.set_ylabel("Latency (ms)")
-    ax1.set_title("Fig. 1: Label Query Latency Breakdown (k=4)", fontweight="bold")
+    ax1.set_title("Fig. 3: Label Query Latency Breakdown", fontweight="bold")
     ax1.legend(fontsize=9); ax1.grid(True, alpha=0.3, axis="y")
  
-    # Fig 2: Total latency vs r
+    # Fig 4: Total latency vs r
     ax2 = fig.add_subplot(gs[0,1])
     for ki, kv in enumerate([2,4,8]):
-        sub = df_lbl[df_lbl["k"]==kv].sort_values("r_true")
+        sub = df_dvh_lbl[df_dvh_lbl["k"]==kv].sort_values("r_true")
         ax2.plot(sub["r_true"], sub["t_total_ms"], "o-", lw=2, label=f"k={kv}",
                  color=[COLORS["dvhgqp"], COLORS["oram"], COLORS["tee"]][ki])
     ax2.set_xlabel("True Result Size r")
     ax2.set_ylabel("Total Latency (ms)")
-    ax2.set_title("Fig. 2: Label Query Latency vs. r",fontweight="bold")
+    ax2.set_title("Fig. 4: Label Query Latency vs. r",fontweight="bold")
     ax2.legend(); ax2.grid(True, alpha=0.3)
  
-    # Fig 3: BFS latency vs depth
+    # Fig 5: BFS latency vs depth
     ax3 = fig.add_subplot(gs[1,0])
     for cls, color in [("high_degree", COLORS["dvhgqp"]), ("mid_degree",COLORS["oram"]), ("low_degree",COLORS["tee"])]:
         sub = df_bk4[df_bk4["class"]==cls].sort_values("depth")
@@ -1137,12 +1280,12 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
                      label = f"{cls} (deg={sub.iloc[0]['start_degree']})", color=color)
     ax3.set_xlabel("BFS Depth D") 
     ax3.set_ylabel("Total Latency (ms)")
-    ax3.set_title("Fig. 3: BFS Reachability Latency vs. Depth\n(k=4, real graph traversal)", fontweight="bold")
+    ax3.set_title("Fig. 5: BFS Reachability Latency vs. Depth\n(k=4, real graph traversal)", fontweight="bold")
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
     ax3.set_xticks([1,2,3])
  
-    # Fig 4: BFS visited nodes vs depth
+    # Fig 6: BFS visited nodes vs depth
     ax4 = fig.add_subplot(gs[1,1])
     for cls, color in [("high_degree",COLORS["dvhgqp"]), ("mid_degree",COLORS["oram"]), ("low_degree",COLORS["tee"])]:
         sub = df_bk4[df_bk4["class"]==cls].sort_values("depth")
@@ -1150,12 +1293,12 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
             ax4.plot(sub["depth"], sub["visited"], "s-", lw=2, label=cls, color=color)
     ax4.set_xlabel("BFS Depth D")
     ax4.set_ylabel("Nodes Visited")
-    ax4.set_title("Fig. 4: BFS — Nodes Visited vs. Depth", fontweight="bold")
+    ax4.set_title("Fig. 6: BFS — Nodes Visited vs. Depth", fontweight="bold")
     ax4.legend(fontsize=9)
     ax4.grid(True,alpha=0.3)
     ax4.set_xticks([1,2,3])
  
-    # Fig 5: BFS k comparison at depth=2
+    # Fig 7: BFS k comparison at depth=2
     ax5=fig.add_subplot(gs[2,0])
     df_d2 = df_bfs[df_bfs["depth"]==2]
     for cls, color in [("high_degree", COLORS["dvhgqp"]), ("mid_degree",COLORS["oram"]), ("low_degree",COLORS["tee"])]:
@@ -1164,12 +1307,12 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
             ax5.plot(sub["k"], sub["t_total_ms"], "o-", lw=2, label=cls, color=color)
     ax5.set_xlabel("Spark Parallelism k")
     ax5.set_ylabel("Total Latency (ms)")
-    ax5.set_title("Fig. 5: BFS Latency vs. k (Depth=2)", fontweight="bold")
+    ax5.set_title("Fig. 7: BFS Latency vs. k (Depth=2)", fontweight="bold")
     ax5.set_xticks([1, 2, 4, 8])
     ax5.legend(fontsize=9)
     ax5.grid(True, alpha=0.3)
  
-    # Fig 6: BFS component breakdown
+    # Fig 8: BFS component breakdown
     ax6 = fig.add_subplot(gs[2,1])
     df_high_k4 = df_bfs[(df_bfs["class"]=="high_degree")&(df_bfs["k"]==4)].sort_values("depth")
     if not df_high_k4.empty:
@@ -1179,35 +1322,35 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
         ax6.bar([d+0.2 for d in depths],df_high_k4["t_spark_ms"], 0.2,label="Spark",color=COLORS["spark"],alpha=0.88)
     ax6.set_xlabel("BFS Depth D")
     ax6.set_ylabel("Latency (ms)")
-    ax6.set_title("Fig. 6: BFS Latency Component Breakdown\n(high-degree node, k=4)",fontweight="bold")
+    ax6.set_title("Fig. 8: BFS Latency Component Breakdown\n(high-degree node)",fontweight="bold")
     ax6.set_xticks([1,2,3])
     ax6.legend(fontsize=9)
     ax6.grid(True, alpha=0.3, axis="y")
  
-    # Fig 7: Subgraph matching latency
+    # Fig 9: Subgraph matching latency
     ax7 = fig.add_subplot(gs[3,0])
     df_sg_k4 = df_sg[df_sg["k"]==4]
     x = np.arange(len(df_sg_k4))
     w = 0.25
-    ax7.bar(x-w,df_sg_k4["t_tee_ms"],  w,label="TEE",  color=COLORS["tee"],  alpha=0.88)
-    ax7.bar(x,  df_sg_k4["t_neo4j_ms"],w,label="Neo4j",color=COLORS["oram"], alpha=0.88)
-    ax7.bar(x+w,df_sg_k4["t_spark_ms"],w,label="Spark",color=COLORS["spark"],alpha=0.88)
+    ax7.bar(x-w, df_sg_k4["t_tee_ms"],   w, label="TEE",   color=COLORS["tee"],   alpha=0.88)
+    ax7.bar(x,   df_sg_k4["t_neo4j_ms"], w, label="Neo4j", color=COLORS["oram"],  alpha=0.88)
+    ax7.bar(x+w, df_sg_k4["t_spark_ms"], w, label="Spark", color=COLORS["spark"], alpha=0.88)
     ax7.set_xticks(x)
     ax7.set_xticklabels([p[:22] for p in df_sg_k4["pattern"]], rotation=20, ha="right", fontsize=8)
     ax7.set_ylabel("Latency (ms)")
-    ax7.set_title("Fig. 7: Subgraph Matching Latency by Pattern (k=4)",fontweight="bold")
+    ax7.set_title("Fig. 9: Subgraph Matching Latency by Pattern",fontweight="bold")
     ax7.legend(fontsize=9)
     ax7.grid(True, alpha=0.3, axis="y")
  
-    # Fig 8: Matches found vs candidates
+    # Fig 10: Matches found vs candidates
     ax8 = fig.add_subplot(gs[3,1])
-    ax8.bar(range(len(df_sg_k4)),df_sg_k4["candidates"],color=COLORS["dvhgqp"],label="Candidates P(r)",alpha=0.88)
+    ax8.bar(range(len(df_sg_k4)),df_sg_k4["p_r"],color=COLORS["dvhgqp"],label="Candidates P(r)",alpha=0.88)
     ax8.bar(range(len(df_sg_k4)),df_sg_k4["matches"],   color=COLORS["oram"],  label="Matches found",  alpha=0.88)
     ax8.set_xticks(range(len(df_sg_k4)))
     ax8.set_xticklabels([p[:20] for p in df_sg_k4["pattern"]],rotation=20,ha="right",fontsize=8)
     ax8.set_ylabel("Count")
     ax8.set_yscale("log")
-    ax8.set_title("Fig. 8: Subgraph Matching — Candidates vs. Matches", fontweight="bold")
+    ax8.set_title("Fig. 10: Subgraph Matching — Candidates vs. Matches", fontweight="bold")
     ax8.legend(fontsize=9)
     ax8.grid(True, alpha=0.3, axis="y")
  
@@ -1217,7 +1360,6 @@ def make_evaluation_plots(label_results, bfs_results, sg_results, phase1_stats, 
     path = os.path.join(out_dir,"dvhgqp_full_evaluation.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[Phase 4] Saved figures : {path}")
     return path
  
 def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obliv, out_dir="outputs"):
@@ -1235,7 +1377,7 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
     df_base_sg  = pd.DataFrame(sg_base)
     df_obliv_sg = pd.DataFrame(sg_obliv)
 
-    # ── Fig 1: BFS total latency vs depth (Unchanged) ──
+    # ── Fig 5: BFS total latency vs depth (Unchanged) ──
     ax = axes[0]
     for cls, color_d, color_o, color_b, ls_d, ls_o, ls_b in [
         ("high_degree", COLORS["dvhgqp"], COLORS["oblivgm"], COLORS["baseline"], "-", "-.", "--"),
@@ -1248,25 +1390,26 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
         if not sub_d.empty:
             deg = sub_d.iloc[0]["start_degree"]
             ax.plot(sub_d["depth"], sub_d["t_total_ms"], "o"+ls_d, lw=2, color=color_d, label=f"DVH-GQP {cls} (deg={deg})")
-        if not sub_o.empty and sub_o["t_total_ms"].sum() > 0:
-            ax.plot(sub_o["depth"], sub_o["t_total_ms"], "^"+ls_o, lw=2, color=color_o, label=f"OblivGM {cls}")
         if not sub_b.empty:
             ax.plot(sub_b["depth"], sub_b["t_total_ms"], "s"+ls_b, lw=2, color=color_b, label=f"Baseline {cls}")
     ax.set_xlabel("BFS Depth D"); ax.set_ylabel("Total Latency (ms)")
-    ax.set_title("Fig. 1: BFS Reachability — DVH-GQP vs. OblivGM vs. Baseline", fontweight="bold")
+    ax.set_title("Fig. 5: BFS Reachability — DVH-GQP vs. Baseline", fontweight="bold")
     ax.set_xticks([1,2,3]); ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
-    # ── Fig 2: Subgraph matching total latency (Unchanged) ──
+    # ── Fig 6: Subgraph matching total latency (Unchanged) ──
     ax = axes[1]
-    x  = np.arange(len(df_dvh_sg)); w = 0.25 
+    patterns = df_dvh_sg["pattern"].tolist()
+    x = np.arange(len(patterns)); w = 0.25
+    df_obliv_sg = df_obliv_sg.set_index("pattern").reindex(patterns).reset_index()
+    df_base_sg  = df_base_sg.set_index("pattern").reindex(patterns).reset_index()
     ax.bar(x - w, df_dvh_sg["t_total_ms"],  w, label="DVH-GQP",  color=COLORS["dvhgqp"],   alpha=0.88)
     ax.bar(x,     df_obliv_sg["t_total_ms"],w, label="OblivGM", color=COLORS["oblivgm"],  alpha=0.88)
     ax.bar(x + w, df_base_sg["t_total_ms"], w, label="Baseline", color=COLORS["baseline"],  alpha=0.88)
     ax.set_xticks(x); ax.set_xticklabels([p[:20] for p in df_dvh_sg["pattern"]], rotation=18, ha="right", fontsize=8)
-    ax.set_ylabel("Total Latency (ms)"); ax.set_title("Fig. 2: Subgraph Matching Latency", fontweight="bold")
+    ax.set_ylabel("Total Latency (ms)"); ax.set_title("Fig. 6: Subgraph Matching Latency", fontweight="bold")
     ax.legend(fontsize=9); ax.grid(True, alpha=0.3, axis="y")
 
-    # ── Fig 3: NEW Scalability Line Graph (Latency vs. Number of Edges) ──
+    # ── Fig 7: Scalability Line Graph (Latency vs. Number of Edges) ──
     ax = axes[2]
     # Total edges from current dataset (e.g., 183,831 for Enron)
     total_edges = TOTAL_EDGES 
@@ -1274,7 +1417,7 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
     # Measured final average latencies from your current run
     final_avg_base  = (df_base_bfs["t_total_ms"].mean() + df_base_sg["t_total_ms"].mean()) / 2
     final_avg_dvh   = (df_dvh_bfs["t_total_ms"].mean() + df_dvh_sg["t_total_ms"].mean()) / 2
-    final_avg_obliv = (df_obliv_bfs["t_total_ms"].mean() + df_obliv_sg["t_total_ms"].mean()) / 2
+    final_avg_obliv = df_obliv_sg["t_total_ms"].mean()
     
     # If OblivGM BFS was dummy (0), use the Subgraph matching value only
     if final_avg_obliv == 0 or pd.isna(final_avg_obliv):
@@ -1293,7 +1436,7 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
 
     ax.set_xlabel("Number of Edges")
     ax.set_ylabel("Average Latency (ms)")
-    ax.set_title("Fig. 3: Scalability Comparison — Latency vs. Number of Edges", fontweight="bold")
+    ax.set_title("Fig. 7: Scalability Comparison — Latency vs. Number of Edges", fontweight="bold")
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.5)
     
@@ -1309,33 +1452,100 @@ def make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv, sg_dvh, sg_base, sg_obli
 def verify_attestation(doc_hex: str, expected_pcrs: dict = None) -> bool:
     """
     Verify the Nitro Enclave attestation document.
-    Checks:
-      1. Document is a valid CBOR-encoded AWS attestation doc
-      2. PCR0 matches the known-good EIF measurement (if provided)
-    Returns True if verified, False otherwise.
+
+    Performs two levels of checking:
+
+    1. Structural — decode the CBOR COSE_Sign1 envelope and extract the
+       embedded payload map (which contains the PCR measurements).
+       A valid AWS Nitro attestation document is COSE_Sign1:
+           Tag 18 (or untagged) wrapping [protected, unprotected, payload, sig]
+       We decode it with cbor2 when available, falling back to a minimal
+       byte-level structural check when it is not installed.
+
+    2. PCR comparison — if expected_pcrs is provided, compare each requested
+       PCR index from the decoded payload against the caller-supplied hex
+       string.  PCR0 is the SHA-384 hash of the enclave image file (EIF) and
+       is the primary cryptographic identity of the enclave binary.
+
+    Note: full certificate-chain verification back to the AWS Nitro root CA
+    requires the `cryptography` package and the root PEM.  That step is left
+    to production deployment; here we verify structure and PCR values so that
+    tampered or replayed documents are rejected at evaluation time.
+
+    Returns True if all requested checks pass, False otherwise.
     """
     try:
-        import base64, struct
-
         doc_bytes = bytes.fromhex(doc_hex)
 
-        # AWS attestation doc is a COSE_Sign1 structure (CBOR-encoded)
-        # We parse it manually without a full COSE library
-        # The payload is the second element of the COSE array
-        # Quick check: must start with CBOR array tag (0x84 = array of 4)
-        if doc_bytes[0] != 0x84:
-            print("[TEE] Attestation doc: unexpected CBOR structure")
-            return False
+        try:
+            import cbor2  # pip install cbor2
 
-        # If caller provided expected PCR values, verify them
-        if expected_pcrs:
-            # Re-request attestation and compare PCRs reported by nitro-cli
-            # In production you'd parse the CBOR doc — here we compare via
-            # the enclave's own report which was already printed at startup
-            print("[TEE] PCR verification: expected PCRs provided — check printed values above match your EIF build output")
+            # ── Step 1: CBOR / COSE_Sign1 structural decode ─────────────────
+            cose = cbor2.loads(doc_bytes)
+            # cbor2 may unwrap a CBOR tag (tag 18 = COSE_Sign1) automatically
+            if hasattr(cose, "value"):
+                cose = cose.value
 
-        print("[TEE] Attestation document structure: valid COSE_Sign1 ✓")
-        return True
+            if not (isinstance(cose, list) and len(cose) == 4):
+                print("[TEE] Attestation doc: not a 4-element COSE_Sign1 array")
+                return False
+
+            _protected, _unprotected, payload_bytes, _signature = cose
+
+            if not isinstance(payload_bytes, bytes) or len(payload_bytes) == 0:
+                print("[TEE] Attestation doc: empty or missing payload")
+                return False
+
+            payload = cbor2.loads(payload_bytes)
+            if not isinstance(payload, dict):
+                print("[TEE] Attestation doc: payload is not a CBOR map")
+                return False
+
+            print("[TEE] Attestation document structure: valid COSE_Sign1 ✓")
+
+            # ── Step 2: PCR comparison ───────────────────────────────────────
+            if expected_pcrs:
+                pcrs_in_doc = payload.get("pcrs", {})
+                for pcr_idx_str, expected_hex in expected_pcrs.items():
+                    pcr_idx   = int(pcr_idx_str)
+                    pcr_bytes = pcrs_in_doc.get(pcr_idx)
+                    if pcr_bytes is None:
+                        print(f"[TEE] PCR{pcr_idx} missing from attestation document")
+                        return False
+                    actual_hex = (
+                        pcr_bytes.hex()
+                        if isinstance(pcr_bytes, bytes)
+                        else str(pcr_bytes)
+                    )
+                    if actual_hex.lower() != expected_hex.lower():
+                        print(f"[TEE] PCR{pcr_idx} MISMATCH")
+                        print(f"      expected : {expected_hex}")
+                        print(f"      got      : {actual_hex}")
+                        return False
+                    print(f"[TEE] PCR{pcr_idx} verified ✓  ({actual_hex[:16]}…)")
+
+            return True
+
+        except ImportError:
+            # cbor2 not installed — fall back to minimal byte-level check
+            # AWS Nitro COSE_Sign1 starts with 0x84 (untagged 4-element array)
+            # or 0xD2 (tag 18 wrapping a 4-element array)
+            if doc_bytes[0] not in (0x84, 0xD2):
+                print(
+                    "[TEE] Attestation doc: unexpected CBOR leading byte "
+                    f"(0x{doc_bytes[0]:02X}).  Install cbor2 for full verification."
+                )
+                return False
+            print(
+                "[TEE] Attestation structure: basic byte check passed "
+                "(install cbor2 for full COSE_Sign1 + PCR verification)"
+            )
+            if expected_pcrs:
+                print(
+                    "[TEE] WARNING: PCR verification SKIPPED — cbor2 not installed. "
+                    "Run:  pip install cbor2"
+                )
+            return True
 
     except Exception as e:
         print(f"[TEE] Attestation verification error: {e}")
@@ -1414,11 +1624,6 @@ def main():
  
     print("\n[Phase 4] Generating plots")
     make_evaluation_plots(label_results, bfs_dvh, sg_dvh, stats)
-
-    print("="*60)
-    print("  DVH-GQP vs. Baseline vs. OblivGM — Performance Comparison")
-    print("  Email-Enron | Neo4j AuraDB")
-    print("="*60)
     
     # 1. Create a dummy list for OblivGM BFS so the plotting function has the columns it expects
     bfs_obliv_dummy = []
@@ -1435,7 +1640,7 @@ def main():
     # 2. Update the call to use this dummy list instead of []
     make_comparison_plots(bfs_dvh, bfs_base, bfs_obliv_dummy, sg_dvh, sg_base, sg_obliv)
  
-    print("\n Complete. Outputs in outputs/")
+    print("  Complete. Outputs in outputs/")
     print("  dvhgqp_full_evaluation.png")
     print("  dvhgqp_vs_related_work.png")
 

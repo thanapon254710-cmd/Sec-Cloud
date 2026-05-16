@@ -1,7 +1,7 @@
 #DVH-GQP  —  TeeDemo
 
 from flask import Flask, request, jsonify, render_template_string
-import os, json, time, math, hashlib, collections, gzip, urllib.request, re
+import os, json, time, math, hashlib, collections, gzip, urllib.request, re, threading
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
@@ -155,6 +155,222 @@ STATE = {
 
 NODE_LABELS = ["Executive", "Manager", "Employee", "External", "Inactive"]
 EDGE_LABELS = ["SEND", "REPLY", "BROADCAST", "INTERNAL"]
+
+NEO4J_SYNC_INTERVAL = 10  # seconds
+
+# ── Auto-sync state ───────────────────────────────────────────
+SYNC_STATE = {
+    "last_sync_ts":    None,   # epoch float
+    "last_sync_str":   "Never",
+    "nodes_added":     0,
+    "nodes_removed":   0,
+    "nodes_updated":   0,
+    "edges_added":     0,
+    "edges_removed":   0,
+    "last_error":      None,
+    "running":         False,
+}
+
+def _rebuild_dsse_index():
+    """Rebuild STATE['dsse_index'] from current node_label and edge_label,
+    and refresh STATE['stats']['label_counts'] so the UI shows correct counts.
+    """
+    Ks = STATE["Ks"]
+    Ke = STATE["Ke"]
+    node_label = STATE["node_label"]
+    edge_label = STATE["edge_label"]
+
+    hist = {}
+    for v, lbl in node_label.items():
+        hist.setdefault(lbl, []).append(("v", v))
+    for (u, v), lbl in edge_label.items():
+        hist.setdefault(lbl, []).append(("e", u, v))
+
+    dsse_index = {}
+    for w, real_ids in hist.items():
+        r       = len(real_ids)
+        p       = pad_size(r)
+        real_e  = [json.dumps(list(x)) for x in real_ids]
+        dummy_e = [json.dumps(f"__dummy_{i}__{w}") for i in range(p - r)]
+        enc_list = [aes_gcm_encrypt(Ke, e.encode()).hex() for e in real_e + dummy_e]
+        dsse_index[prf(Ks, w)] = {"entries": enc_list, "p_r": p, "label": w, "r": r}
+
+    STATE["dsse_index"] = dsse_index
+
+    # Keep stats in sync so the UI label badges reflect real counts
+    STATE["stats"]["labels"]       = list(hist.keys())
+    STATE["stats"]["label_counts"] = {w: len(ids) for w, ids in hist.items()}
+
+    print(f"[DSSE] Index rebuilt — {len(dsse_index)} label buckets, "
+          f"{sum(v['r'] for v in dsse_index.values())} real entries")
+
+
+def _neo4j_auto_sync():
+    """Background thread: pull Neo4j every NEO4J_SYNC_INTERVAL seconds and
+    reconcile creates, deletes, and label edits into STATE."""
+    while True:
+        time.sleep(NEO4J_SYNC_INTERVAL)
+        if not STATE["loaded"] or not STATE["driver"]:
+            continue
+        try:
+            _run_neo4j_sync()
+        except Exception as exc:
+            SYNC_STATE["last_error"] = str(exc)
+            print(f"[AutoSync] Error: {exc}")
+
+def _run_neo4j_sync():
+    """Pull the current Neo4j snapshot and apply diffs to STATE."""
+    driver = STATE["driver"]
+    K      = STATE["K"]
+    Ke     = STATE["Ke"]
+
+    nodes_added = nodes_removed = nodes_updated = 0
+    edges_added = edges_removed = 0
+
+    with driver.session() as session:
+        # ── 1. Nodes ─────────────────────────────────────────
+        result  = session.run(
+            "MATCH (n:EncNode {dataset_id:$ds}) "
+            "RETURN n.node_id AS nid, n.label AS lbl, n.adj_ct AS adj_ct",
+            ds=DATASET_ID)
+        neo4j_nodes = {}           # nid(int) -> {lbl, adj_ct}
+        for rec in result:
+            try:
+                nid = int(rec["nid"])
+            except (TypeError, ValueError):
+                continue
+            neo4j_nodes[nid] = {"lbl": rec["lbl"] or "Inactive",
+                                 "adj_ct": rec["adj_ct"] or ""}
+
+        state_nids  = set(STATE["nodes"])
+        neo4j_nids  = set(neo4j_nodes.keys())
+
+        # Additions
+        for nid in neo4j_nids - state_nids:
+            info = neo4j_nodes[nid]
+            STATE["nodes"].add(nid)
+            STATE["node_label"][nid] = info["lbl"]
+            STATE["adj"][nid] = []
+            STATE["enc_adj"][nid] = info["adj_ct"] or aes_gcm_encrypt(
+                K, json.dumps([]).encode()).hex()
+            nodes_added += 1
+            print(f"[AutoSync] ✚ Node added: {nid} ({info['lbl']})")
+
+        # Deletions
+        for nid in state_nids - neo4j_nids:
+            STATE["nodes"].discard(nid)
+            STATE["node_label"].pop(nid, None)
+            STATE["adj"].pop(nid, None)
+            STATE["enc_adj"].pop(nid, None)
+            nodes_removed += 1
+            print(f"[AutoSync] ✖ Node removed: {nid}")
+
+        # Label edits
+        for nid in state_nids & neo4j_nids:
+            new_lbl = neo4j_nodes[nid]["lbl"]
+            if STATE["node_label"].get(nid) != new_lbl:
+                print(f"[AutoSync] ✎ Node {nid} label: "
+                      f"{STATE['node_label'].get(nid)} → {new_lbl}")
+                STATE["node_label"][nid] = new_lbl
+                nodes_updated += 1
+            # adj_ct update (if Neo4j has a non-empty, different ciphertext)
+            new_adj_ct = neo4j_nodes[nid]["adj_ct"]
+            if new_adj_ct and new_adj_ct != STATE["enc_adj"].get(nid):
+                STATE["enc_adj"][nid] = new_adj_ct
+                STATE["adj"][nid] = []   # plaintext stale; will decrypt on demand
+
+        # ── 2. Edges ─────────────────────────────────────────
+        result = session.run(
+            "MATCH (a:EncNode {dataset_id:$ds})-[r:ENC_EDGE]->(b:EncNode {dataset_id:$ds}) "
+            "RETURN a.node_id AS src, b.node_id AS dst, r.edge_label AS lbl",
+            ds=DATASET_ID)
+        neo4j_edges = set()
+        neo4j_edge_label = {}
+        for rec in result:
+            try:
+                u, v = int(rec["src"]), int(rec["dst"])
+            except (TypeError, ValueError):
+                continue
+            key = (min(u, v), max(u, v))
+            neo4j_edges.add(key)
+            neo4j_edge_label[key] = rec["lbl"] or "SEND"
+
+        state_edges = {(min(u, v), max(u, v)) for u, v in STATE["edges"]}
+
+        # Additions
+        for key in neo4j_edges - state_edges:
+            STATE["edges"].append(key)
+            STATE["edge_label"][key] = neo4j_edge_label[key]
+            # Update plaintext adjacency for both endpoints
+            u, v = key
+            lbl  = neo4j_edge_label[key]
+            STATE["adj"].setdefault(u, []).append((v, lbl))
+            STATE["adj"].setdefault(v, []).append((u, lbl))
+            # Re-encrypt adjacency
+            STATE["enc_adj"][u] = aes_gcm_encrypt(
+                K, json.dumps(STATE["adj"][u]).encode()).hex()
+            STATE["enc_adj"][v] = aes_gcm_encrypt(
+                K, json.dumps(STATE["adj"][v]).encode()).hex()
+            edges_added += 1
+            print(f"[AutoSync] ✚ Edge added: {u}↔{v} ({lbl})")
+
+        # Deletions
+        for key in state_edges - neo4j_edges:
+            u, v = key
+            try:
+                STATE["edges"].remove(key)
+            except ValueError:
+                pass
+            STATE["edge_label"].pop(key, None)
+            # Rebuild adjacency for affected nodes
+            for node in (u, v):
+                STATE["adj"][node] = [
+                    (nbr, lbl) for nbr, lbl in STATE["adj"].get(node, [])
+                    if nbr not in (u, v) or (nbr == u and node != v) or (nbr == v and node != u)
+                ]
+                # simpler: rebuild from scratch
+            for node in (u, v):
+                neighbors = []
+                for eu, ev in STATE["edges"]:
+                    lbl = STATE["edge_label"].get((eu, ev)) or STATE["edge_label"].get((ev, eu), "")
+                    if eu == node:
+                        neighbors.append((ev, lbl))
+                    elif ev == node:
+                        neighbors.append((eu, lbl))
+                STATE["adj"][node] = neighbors
+                STATE["enc_adj"][node] = aes_gcm_encrypt(
+                    K, json.dumps(neighbors).encode()).hex()
+            edges_removed += 1
+            print(f"[AutoSync] ✖ Edge removed: {u}↔{v}")
+
+    # ── Rebuild DSSE index whenever anything changed ──────────
+    # Label-count queries (e.g. "How many Executive nodes?") read
+    # dsse_index — NOT node_label directly. Without rebuilding it,
+    # query results stay stale even after STATE["nodes"] is updated.
+    changed = nodes_added or nodes_removed or nodes_updated or edges_added or edges_removed
+    if changed:
+        _rebuild_dsse_index()
+        STATE["stats"].update({
+            "nodes": len(STATE["nodes"]),
+            "edges": len(STATE["edges"]),
+        })
+
+    now = time.time()
+    SYNC_STATE.update({
+        "last_sync_ts":  now,
+        "last_sync_str": time.strftime("%H:%M:%S UTC", time.gmtime(now)),
+        "nodes_added":   nodes_added,
+        "nodes_removed": nodes_removed,
+        "nodes_updated": nodes_updated,
+        "edges_added":   edges_added,
+        "edges_removed": edges_removed,
+        "last_error":    None,
+        "running":       True,
+    })
+    print(f"[AutoSync] {time.strftime('%H:%M:%S')} "
+          f"+{nodes_added}/-{nodes_removed}/~{nodes_updated} nodes | "
+          f"+{edges_added}/-{edges_removed} edges"
+          + (" | DSSE rebuilt" if changed else " | no changes"))
 
 def assign_labels(nodes, edges):
     degree = {}
@@ -676,6 +892,12 @@ HTML = '''<!DOCTYPE html>
       <div class="stats-grid" id="statsGrid"></div>
       <div class="label-tags" id="labelTags"></div>
     </div>
+    <div id="syncBanner" style="display:none;margin-top:10px;padding:8px 12px;border-radius:6px;font-size:0.82rem;display:flex;align-items:center;gap:10px;background:var(--surface2,#f1f5f9);border:1px solid var(--border,#e2e8f0)">
+      <span id="syncDot" style="width:8px;height:8px;border-radius:50%;background:#94a3b8;flex-shrink:0"></span>
+      <span id="syncText">Neo4j auto-sync starting…</span>
+      <span style="margin-left:auto;opacity:.6" id="syncCounts"></span>
+      <button onclick="manualSync()" style="padding:3px 9px;font-size:0.78rem;border-radius:4px;border:1px solid var(--border,#e2e8f0);background:#fff;cursor:pointer;color:var(--blue)">Sync now</button>
+    </div>
   </div>
 
   <div class="card">
@@ -689,7 +911,7 @@ HTML = '''<!DOCTYPE html>
     <input id="queryInput" placeholder="e.g. How many CONNECTIONS does node 42 have?">
     <div class="query-row">
       <button onclick="runQuery()" id="queryBtn" disabled>Run Query</button>
-      <button class="secondary" onclick="clearResult()">Clear</button>
+      <button class="secondary" id="clearBtn" onclick="clearResult()">Clear</button>
       <span id="queryHint" class="query-hint">Load a dataset first to get started</span>
     </div>
     <div class="chips" id="queryChips"></div>
@@ -762,14 +984,7 @@ async function loadDataset() {
       <div class="stat-box"><div class="stat-value">${data.stats.labels.length}</div><div class="stat-label">Label Types</div></div>
     `;
     document.getElementById('graphStats').style.display = 'block';
-
-    const lt = document.getElementById('labelTags');
-    const tagClass = {'Executive':'tag-inf','Manager':'tag-per','Employee':'tag-com','External':'tag-org','Inactive':'tag-bot'};
-    lt.innerHTML = data.stats.labels.map(l => {
-      const cls = tagClass[l] || 'tag-edge';
-      const cnt = data.stats.label_counts[l];
-      return `<span class="label-tag ${cls}">${l}: ${cnt.toLocaleString()}</span>`;
-    }).join('');
+    _refreshStatsPanel(data.stats);
 
     document.getElementById('queryBtn').disabled = false;
     document.getElementById('queryHint').textContent = '';
@@ -788,6 +1003,7 @@ async function runQuery() {
   const q = document.getElementById('queryInput').value.trim();
   if (!q || !graphLoaded) return;
   document.getElementById('queryBtn').disabled = true;
+  document.getElementById('clearBtn').disabled = true;   // disable Clear while running
   document.getElementById('resultPanel').className = 'card result-panel visible';
   document.getElementById('resultNumber').textContent = '...';
   document.getElementById('resultUnit').textContent = '';
@@ -813,6 +1029,7 @@ async function runQuery() {
     document.getElementById('resultExplanation').textContent = e.message;
   }
   document.getElementById('queryBtn').disabled = false;
+  document.getElementById('clearBtn').disabled = false;  // re-enable Clear
 }
 
 function clearResult() {
@@ -820,10 +1037,105 @@ function clearResult() {
   document.getElementById('queryInput').value = '';
 }
 
+// ── Stats panel refresh (shared by load + sync) ──────────────
+function _refreshStatsPanel(stats) {
+  if (!stats) return;
+  const sg = document.getElementById('statsGrid');
+  if (!sg) return;
+  sg.innerHTML = `
+    <div class="stat-box"><div class="stat-value">${stats.nodes.toLocaleString()}</div><div class="stat-label">Nodes</div></div>
+    <div class="stat-box"><div class="stat-value">${stats.edges.toLocaleString()}</div><div class="stat-label">Edges</div></div>
+    <div class="stat-box"><div class="stat-value">${(stats.max_degree||0).toLocaleString()}</div><div class="stat-label">Max Degree</div></div>
+    <div class="stat-box"><div class="stat-value">${stats.avg_degree||0}</div><div class="stat-label">Avg Degree</div></div>
+    <div class="stat-box"><div class="stat-value">${(stats.labels||[]).length}</div><div class="stat-label">Label Types</div></div>
+  `;
+  const lt = document.getElementById('labelTags');
+  const tagClass = {'Executive':'tag-inf','Manager':'tag-per','Employee':'tag-com','External':'tag-org','Inactive':'tag-bot'};
+  lt.innerHTML = (stats.labels||[]).map(l => {
+    const cls = tagClass[l] || 'tag-edge';
+    const cnt = (stats.label_counts||{})[l] || 0;
+    return `<span class="label-tag ${cls}">${l}: ${cnt.toLocaleString()}</span>`;
+  }).join('');
+}
+
+// ── Neo4j auto-sync status polling ───────────────────────────
+let _syncInterval = null;
+
+function _fmtSyncTime(str) {
+  return str || 'Never';
+}
+
+function _updateSyncBanner(data) {
+  const banner = document.getElementById('syncBanner');
+  const dot    = document.getElementById('syncDot');
+  const txt    = document.getElementById('syncText');
+  const counts = document.getElementById('syncCounts');
+
+  if (!data.neo4j_active) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'flex';
+
+  if (data.last_error) {
+    dot.style.background = '#ef4444';
+    txt.textContent = `Sync error: ${data.last_error}`;
+  } else if (!data.last_sync_str || data.last_sync_str === 'Never') {
+    dot.style.background = '#f59e0b';
+    txt.textContent = `Auto-sync active — waiting for first cycle (every ${data.interval_s}s)…`;
+  } else {
+    dot.style.background = '#22c55e';
+    const changes = (data.nodes_added||0) + (data.nodes_removed||0) + (data.nodes_updated||0)
+                  + (data.edges_added||0) + (data.edges_removed||0);
+    txt.textContent = `Last synced at ${_fmtSyncTime(data.last_sync_str)} — ${changes > 0 ? changes + ' change(s)' : 'no changes'}`;
+  }
+
+  const parts = [];
+  if (data.nodes_added)   parts.push(`+${data.nodes_added} nodes`);
+  if (data.nodes_removed) parts.push(`-${data.nodes_removed} nodes`);
+  if (data.nodes_updated) parts.push(`~${data.nodes_updated} labels`);
+  if (data.edges_added)   parts.push(`+${data.edges_added} edges`);
+  if (data.edges_removed) parts.push(`-${data.edges_removed} edges`);
+  counts.textContent = parts.join(' | ');
+
+  // Refresh the stats panel if the sync returned fresh stats
+  if (data.stats) _refreshStatsPanel(data.stats);
+}
+
+async function pollSyncStatus() {
+  try {
+    const resp = await fetch('/api/sync_status');
+    const data = await resp.json();
+    _updateSyncBanner(data);
+  } catch(_) {}
+}
+
+async function manualSync() {
+  const btn = document.querySelector('#syncBanner button');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  try {
+    const resp = await fetch('/api/sync_neo4j', {method:'POST'});
+    const data = await resp.json();
+    if (data.error) { alert('Sync error: ' + data.error); return; }
+    _updateSyncBanner({...data, neo4j_active: true, interval_s: 10});
+  } catch(e) {
+    alert('Sync error: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync now'; }
+  }
+}
+
+function startSyncPolling() {
+  if (_syncInterval) clearInterval(_syncInterval);
+  pollSyncStatus();
+  _syncInterval = setInterval(pollSyncStatus, 10000);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('queryInput').addEventListener('keydown', e => {
     if (e.key === 'Enter' && e.ctrlKey) runQuery();
   });
+  startSyncPolling();
 });
 </script>
 </body>
@@ -888,6 +1200,24 @@ def api_load():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/add_node', methods=['POST'])
+def api_add_node():
+    data = request.get_json()
+    nid = int(data['node_id'])
+    
+    # Update in-memory STATE
+    STATE["nodes"].add(nid)
+    STATE["node_label"][nid] = "Inactive"  # no edges yet
+    
+    # Optionally sync to Neo4j
+    if STATE["driver"]:
+        with STATE["driver"].session() as session:
+            session.run("""
+                CREATE (n:EncNode {dataset_id:$ds, node_id:$nid, label:'Inactive', adj_ct:''})
+            """, ds=DATASET_ID, nid=str(nid))
+    
+    return jsonify({"ok": True, "node_id": nid})
+
 @app.route('/api/query', methods=['POST'])
 def api_query():
     if not STATE["loaded"]:
@@ -904,12 +1234,52 @@ def api_query():
 def api_tee_status():
     return jsonify({"tee_available": _probe_tee(), "neo4j_available": _NEO4J_AVAILABLE, "spark_available": _SPARK_AVAILABLE})
 
+@app.route('/api/sync_neo4j', methods=['POST'])
+def api_sync_neo4j():
+    """Manual on-demand sync (also triggered automatically every 10 s)."""
+    if not STATE["loaded"]:
+        return jsonify({"error": "Load a dataset first"}), 400
+    if not STATE["driver"]:
+        return jsonify({"error": "Neo4j not connected — driver is None"}), 400
+    try:
+        _run_neo4j_sync()
+        return jsonify({
+            "ok": True,
+            **{k: SYNC_STATE[k] for k in (
+               "last_sync_str", "nodes_added", "nodes_removed",
+               "nodes_updated", "edges_added", "edges_removed")},
+            "total_nodes": len(STATE["nodes"]),
+            "total_edges": len(STATE["edges"]),
+            "stats":       STATE["stats"],   # for UI stats panel refresh
+            "neo4j_active": True,
+            "interval_s":  NEO4J_SYNC_INTERVAL,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sync_status', methods=['GET'])
+def api_sync_status():
+    """Return the current auto-sync state (polled by the UI every 10 s)."""
+    return jsonify({
+        **SYNC_STATE,
+        "interval_s":   NEO4J_SYNC_INTERVAL,
+        "neo4j_active": STATE["driver"] is not None and STATE["loaded"],
+        "total_nodes":  len(STATE["nodes"]),
+        "total_edges":  len(STATE["edges"]),
+        "stats":        STATE["stats"],      # for UI stats panel refresh
+    })
+
 if __name__ == '__main__':
+    # Start background auto-sync thread
+    _sync_thread = threading.Thread(target=_neo4j_auto_sync, daemon=True, name="neo4j-autosync")
+    _sync_thread.start()
+
     print("=" * 55)
     print("  DVH-GQP  ·  TeeDemo")
     print(f"  TEE (Nitro Enclave): {'probing on first query' }")
     print(f"  Neo4j : {'available' if _NEO4J_AVAILABLE else 'not installed — skipped'}")
     print(f"  Spark : {'available' if _SPARK_AVAILABLE else 'not installed — skipped'}")
+    print(f"  Auto-sync: every {NEO4J_SYNC_INTERVAL}s (creates/deletes/edits)")
     print("  Open  : http://localhost:5000")
     print("=" * 55)
     app.run(debug=False, host='0.0.0.0', port=5000)
